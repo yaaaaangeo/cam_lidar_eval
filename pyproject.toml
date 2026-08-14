@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cam-lidar-eval"
+version = "0.1.0"
+description = "GT-free quality evaluation for an existing camera-LiDAR extrinsic calibration"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Cam-LiDAR Eval contributors" },
+]
+keywords = [
+    "camera-lidar-calibration",
+    "extrinsic-calibration",
+    "sensor-fusion",
+    "point-cloud",
+    "autonomous-driving",
+    "robotics",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.8",
+    "scipy>=1.11",
+    "matplotlib>=3.8",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",  # optional: every test file also runs standalone with `python3 tests/test_X.py`
+]
+
+[project.urls]
+Homepage = "https://github.com/YOUR_ORG/cam-lidar-eval"
+Issues = "https://github.com/YOUR_ORG/cam-lidar-eval/issues"
+
+[project.scripts]
+cam-lidar-eval = "app.cli:main"
+
+# This repo intentionally uses a flat, multi-top-level-package layout
+# (input/, geometry/, evaluation/, quality/, visualization/, report/, app/)
+# rather than a single nested namespace package, matching how the modules
+# already import each other (e.g. `from input.camera import ...`). Listing
+# them explicitly avoids setuptools' auto-discovery pulling in tests/.
+[tool.setuptools]
+packages = [
+    "app",
+    "evaluation",
+    "geometry",
+    "input",
+    "quality",
+    "report",
+    "visualization",
+]
