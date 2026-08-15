@@ -5,8 +5,10 @@ GT(Ground Truth) 없이 평가하는 툴입니다. 이 툴은 새로운 calibrat
 계산하지 않습니다 — 이미 갖고 있는 calibration을 얼마나 신뢰할 수 있는지,
 GT 없이 알려줍니다.
 
-> 전체 설계 근거는 [`evaluation_metric_spec.md`](evaluation_metric_spec.md)에 있습니다. 
-> 이 README는 "어떻게 실행하는지 / 어떻게 만들어졌는지"를 다루는 실전 가이드입니다.
+> 전체 설계 근거는 [`evaluation_metric_spec.md`](evaluation_metric_spec.md)에
+> 있습니다(코드 전반의 docstring·주석에 흩어져 있던 근거를 취합해
+> 복원한 문서입니다 — 자세한 경위는 그 문서 맨 위 안내 참고). 이 README는
+> "어떻게 실행하는지 / 어떻게 만들어졌는지"를 다루는 실전 가이드입니다.
 
 ---
 
@@ -35,8 +37,17 @@ pip install -e .
 ```
 
 `numpy`, `opencv-python`, `scipy`, `matplotlib`, `PyYAML`이 설치되고,
-`cam-lidar-eval` 콘솔 명령어가 추가됩니다. GPU도, ROS도, 외부 서비스도
+`cam-lidar-eval` 콘솔 명령어가 추가됩니다. GPU도, 외부 서비스도
 필요 없습니다.
+
+rosbag(rosbag1 `.bag` / rosbag2 디렉토리) 소스로 데이터를 읽으려면
+추가로 `pip install -e ".[rosbag]"`을 쓰세요 — 이건 순수 Python
+bag 리더(`rosbags`/`rosbags-image`)라서 **실제 ROS/rclpy 설치는
+여전히 필요 없습니다**. `--config`의 `camera.source`/`lidar.source`를
+`rosbag`으로 지정하면 사용할 수 있습니다 (§3 참고). 단, 살아있는
+ROS 노드를 구독하는 `ros_topic` 소스는 지원하지 않습니다 — 그건
+녹화된 bag 파일을 읽는 것과 달리 실시간 ROS2 미들웨어/DDS 연결이
+필요한, 근본적으로 다른 문제라서 이 툴의 스코프 밖입니다.
 
 editable install 없이 순수 pip만 쓰고 싶다면 `pip install -r requirements.txt`도
 가능합니다 (이 경우 `cam-lidar-eval` 명령어 대신 레포 루트에서
@@ -65,8 +76,11 @@ cam-lidar-eval --config my_config.yaml --output-dir out/
 ```
 
 전체 YAML config 스키마(camera intrinsics/distortion, LiDAR sensor spec,
-extrinsic, evaluation 파라미터)는 `app/cli.py`의 모듈 docstring을
-참고하세요. 최소 예시:
+extrinsic, evaluation 파라미터)는 `python -m app.cli --help`의 맨 아래
+epilog나 `app/cli.py`의 모듈 docstring을 참고하세요. 필수 키가
+빠지거나 형식이 잘못된 경우 어떤 필드가 문제인지 전부 나열하고 스키마
+위치를 안내하는 에러 메시지가 뜹니다(raw `KeyError`가 아닙니다). 최소
+예시:
 
 ```yaml
 camera:
@@ -100,14 +114,44 @@ evaluation:
   edge_radius_px: 3.0
 ```
 
+`image_dir`/`pcd_dir` 대신 rosbag(rosbag1 `.bag` 또는 rosbag2 디렉토리)에서
+바로 읽고 싶다면 `source: rosbag`을 지정하세요 (`pip install -e ".[rosbag]"`
+필요):
+
+```yaml
+camera:
+  source: rosbag
+  rosbag_path: /data/my_recording.bag   # 또는 rosbag2 디렉토리
+  topic: /camera/image_raw              # 생략 가능(이미지 topic이 하나뿐이면)
+  width: 1920
+  height: 1080
+  model: pinhole
+  intrinsics: {fx: 1400.0, fy: 1400.0, cx: 960.0, cy: 540.0}
+
+lidar:
+  source: rosbag
+  rosbag_path: /data/my_recording.bag
+  topic: /lidar/points                  # 생략 가능(PointCloud2 topic이 하나뿐이면)
+  sensor_spec:
+    horizontal_resolution_deg: 0.2
+```
+
+`camera`와 `lidar`를 서로 다른 소스로 섞어 쓸 수도 있습니다(예: 카메라는
+rosbag, LiDAR는 `pcd_dir`). 프레임 timestamp는 메시지의 `header.stamp`를
+우선 쓰고, unstamped(0으로 채워진) 메시지는 bag 기록 시각으로 대체하며
+그 사실을 warning으로 남깁니다.
+
 유용한 플래그: `--fail-on-bad` (overall quality가 BAD/FAIL이면 exit code
 0이 아니게 — CI용), `--fail-on-partial` (M2/M3/M4 중 하나라도 완전히
 FAIL해서 Overall Quality 계산에서 제외됐다면 exit code 0이 아니게 —
 overall quality 자체는 나머지 카테고리만으로 GOOD/WARNING이 나올 수
 있으므로 `--fail-on-bad`와는 별개로 필요; CI용), `--advanced` (Phase-5
 진단도 함께 실행), `--no-visuals` (이미지 생성 생략, 훨씬 빠름),
+`--json-only` (`report.html` 자체를 생성하지 않고 `report.json`만 —
+CI 게이트 용도로 HTML이 필요 없을 때 `--no-visuals`보다 더 가벼움),
 `--weights geometry=0.5,...` (카테고리 가중치 오버라이드), `--frame-index
-N` (M2의 대표값을 어느 프레임에서 가져올지 지정).
+N` (M2의 대표값을 어느 프레임에서 가져올지 지정), `--version` (설치된
+버전 확인).
 
 ---
 
@@ -125,15 +169,15 @@ N` (M2의 대표값을 어느 프레임에서 가져올지 지정).
                     │
                     ▼
       ┌──────────────────────────┐
-      │ M0 Sanity Gate           │   evaluation/sanity_gate.py
-      │ (게이트, 점수 아님)       │
+      │ M0 Sanity Gate (게이트,  │   evaluation/sanity_gate.py
+      │ 점수 아님)                │
       └──────────────┬───────────┘
                       ▼
-   ┌──────────────────────────────────────┐
-   │            Evaluation Engine         │
-   │  M2 Geometry │ M3 Generalization     │  evaluation/edge_alignment.py
-   │              │ M4 Stability          │  evaluation/holdout_consistency.py
-   └───────┬──────┴──────────┬────────────┘     evaluation/multiframe_consistency.py
+   ┌─────────────────────────────────────┐
+   │            Evaluation Engine          │
+   │  M2 Geometry │ M3 Generalization │   │  evaluation/edge_alignment.py
+   │              │ M4 Stability      │   │  evaluation/holdout_consistency.py
+   └───────┬──────┴──────────┬────────┘   │  evaluation/multiframe_consistency.py
            ▼                 ▼
    quality/noise_floor.py → floor(Z), 센서 상대적 threshold
    quality/normalization.py → 0-100 점수 곡선, floor(Z) 배수에 고정
@@ -195,12 +239,12 @@ cam_lidar_eval/
 ├── app/
 │   └── cli.py                   진입점: config/demo → pipeline → report → 콘솔 요약
 │
-├── tests/                      20개 파일에 걸친 253개 테스트 (§7 참고)
+├── tests/                      20개 파일에 걸친 276개 테스트 (§7 참고)
 │
 ├── pyproject.toml               패키지 메타데이터, 의존성, `cam-lidar-eval` 콘솔 스크립트
 ├── requirements.txt             `pip install -e .`의 순수 pip 대안
 ├── run_tests.sh                 전체 테스트 스위트 실행, CI 친화적 exit code
-├── .github/workflows/ci.yaml     GitHub Actions: Python 3.10-3.12에서 install + test + CLI smoke test
+├── .github/workflows/ci.yaml     GitHub Actions: lint(ruff) + Python 3.10-3.13 install/test/smoke test
 └── LICENSE                      MIT
 ```
 
@@ -297,22 +341,25 @@ python3 tests/test_noise_floor.py         # 또는 개별 파일 직접 실행
 ```
 
 `run_tests.sh`는 뭔가 실패하면 exit code가 0이 아니게 되며,
-`.github/workflows/ci.yaml`이 매 push/PR마다 (Python 3.10-3.12) 실행하는
-것과 정확히 동일한 스크립트입니다.
+`.github/workflows/ci.yaml`이 매 push/PR마다 (Python 3.10-3.13) 실행하는
+것과 정확히 동일한 스크립트입니다. CI는 이와 별개로 `ruff check .`를
+돌리는 `lint` job도 하나 더 실행합니다(pyflakes 동급 규칙만 켜져
+있음 — `dev` extras의 `ruff`로 로컬에서도 동일하게 돌릴 수 있습니다:
+`pip install -e ".[dev]" && ruff check .`).
 
 pytest 의존성 불필요 — 모든 테스트 파일은 자체 러너
 (`if __name__ == "__main__":`)를 내장하고 있어 테스트별 PASS/FAIL을
 출력하고 실패 시 exit code가 0이 아니게 됩니다. 따라서
 `python3 tests/test_X.py`는 단독으로도, CI에서도 그대로 동작합니다.
 
-**20개 파일에 걸친 253개 테스트**, 전부 통과 (전체 실행 약 2~3분):
+**20개 파일에 걸친 276개 테스트**, 전부 통과 (전체 실행 약 2~3분):
 
 | 파일 | 테스트 수 | 커버리지 |
 |---|---|---|
 | `test_transform.py` | 18 | SE(3) 수학 |
 | `test_projection.py` | 13 | Pinhole/fisheye 투영 |
-| `test_camera.py` | 8 | Camera 로더 |
-| `test_lidar.py` | 13 | PCD/PLY 파서, LiDAR 로더 |
+| `test_camera.py` | 12 | Camera 로더 (rosbag 포함) |
+| `test_lidar.py` | 19 | PCD/PLY 파서, LiDAR 로더 (rosbag 포함) |
 | `test_extrinsic.py` | 11 | 회전 포맷, T_CL/T_LC 방향 처리 |
 | `test_dataset.py` | 9 | 타임스탬프 동기화, time_blocks() |
 | `test_noise_floor.py` | 21 | floor(Z) 유도 및 fallback 규칙 |
@@ -324,11 +371,11 @@ pytest 의존성 불필요 — 모든 테스트 파일은 자체 러너
 | `test_plane_consistency.py` | 10 | 평면 피팅 + 경계 정합성 |
 | `test_perturbation.py` | 7 | Local-minimum 검출 |
 | `test_temporal_drift.py` | 9 | 추세 회귀, 유의성 게이팅 |
-| `test_quality_score.py` | 12 | 카테고리 집계, 가중치 처리 |
+| `test_quality_score.py` | 14 | 카테고리 집계, 가중치 처리, partial-result WARNING 캡 |
 | `test_report.py` | 20 | JSON/HTML 생성, NaN 안전성, visuals 임베딩 |
 | `test_visualization.py` | 13 | Overlay/trajectory/histogram 렌더링 |
 | `test_m0_report_integration.py` | 2 | M0 → report end-to-end |
-| `test_cli.py` | 20 | Demo 모드, config 로딩, 전체 파이프라인, exit code |
+| `test_cli.py` | 35 | Demo 모드, config 로딩(rosbag 포함), 전체 파이프라인, exit code |
 
 모든 MVP metric(M2/M3/M4)은 **known, controllable한 ground truth를 가진
 합성 장면**(알려진 `T_CL` 아래에서 그려진 이미지 edge와 정확히 일치하도록
@@ -345,19 +392,22 @@ pytest 의존성 불필요 — 모든 테스트 파일은 자체 러너
 
 ## 8. 알려진 한계 / 구현하지 않은 것
 
-- **rosbag / ROS topic 소스**는 스텁 처리되어 있습니다(`NotImplementedError`)
-  — 이 환경에 ROS 역직렬화 의존성이 없기 때문입니다. `image_dir` /
-  `pcd_dir` 소스는 완전히 구현되어 있습니다.
 - **Re-calibration repeatability** (스펙 §13의 "Level 2": subset별로
   calibration을 재수행해서 결과 T들을 비교)는 명시적으로 스코프 밖입니다
   — 이 툴은 *기존* calibration을 평가할 뿐, 새로 계산하지 않습니다.
+  구현하려면 사실상 별도의 camera-LiDAR calibration 알고리즘 툴을 새로
+  만드는 셈이라, 이 프로젝트의 정체성(GT-free *평가* 툴)과 충돌합니다.
 - **Photometric consistency**는 원 설계 노트에 따라 보류했습니다
   (illumination/exposure/reflectance가 calibration 품질과 너무 쉽게
-  섞여버려서 첫 버전에는 부적합).
+  섞여버려서 첫 버전에는 부적합). 이건 "아직 안 만듦"이 아니라 "충분한
+  근거 없이 만들면 신뢰도 낮은 metric이 나올 위험이 있다"는 의도적
+  판단이라, 억지로 구현하기보다 이 판단을 유지합니다.
 - **GT mode** (실제 ground-truth transform 대비 정확도, 연구/벤치마크용)는
   스펙에 별도 모드로 설명되어 있지만 여기서는 구현하지 않았습니다 —
   이 툴은 GT-free 모드 전용입니다.
 - Advanced metric(`--advanced`)들은 진단용이며 **quality_score에 영향을
   주지 않습니다** — MVP 셋만큼 검증되지 않았고, headline 점수에 기여하기보다
   다른 질문(local optimality, 추세, 단일 표면 체크)에 답하기 때문에
-  의도적으로 분리했습니다.
+  의도적으로 분리했습니다. (이건 한계가 아니라 의도된 설계입니다 —
+  advanced metric이 quality_score에 영향을 주기 시작하면 검증 수준이
+  다른 두 metric 집합이 섞여버립니다.)

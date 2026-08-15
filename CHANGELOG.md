@@ -5,6 +5,116 @@
 
 ## [Unreleased]
 
+### 추가 (Added)
+
+- **rosbag / rosbag2 소스 지원.** `input/lidar.py`의
+  `load_lidar_from_rosbag()`와 `input/camera.py`의
+  `load_camera_from_rosbag()`가 더 이상 `NotImplementedError`를 내지
+  않습니다. 순수 Python 라이브러리인 `rosbags`(+ 카메라용
+  `rosbags-image`)를 이용해 rosbag1(`.bag`)과 rosbag2(디렉토리) 둘 다
+  읽습니다 — **실제 ROS/rclpy 설치는 필요 없습니다**. 새 optional
+  dependency 그룹으로 분리되어 있어(`pip install
+  "cam-lidar-eval[rosbag]"`), `image_dir`/`pcd_dir`만 쓰는 기존
+  사용자는 아무 영향이 없습니다.
+  - LiDAR: `sensor_msgs/msg/PointCloud2` 메시지를 읽어 x/y/z(+intensity)
+    필드를 추출합니다. `PointField`의 offset/datatype 정보로 구조를
+    직접 파싱하므로(기존 PCD binary 리더와 같은 방식) `sensor_msgs_py`
+    같은 ROS 전용 포인트클라우드 라이브러리가 필요 없습니다.
+  - Camera: `sensor_msgs/msg/Image` / `CompressedImage` 메시지를
+    `rosbags.image.message_to_cvimage()`로 BGR OpenCV 배열로 변환합니다.
+  - 프레임 timestamp는 메시지의 `header.stamp`를 우선 사용하고,
+    unstamped(0으로 채워진) 메시지는 bag의 자체 기록 시각으로 대체하며
+    이 사실을 warning으로 명시적으로 남깁니다(조용히 근사치를 쓰지
+    않음 — `quality/noise_floor.py`의 fallback-warning 관례와 동일한
+    원칙).
+  - Topic을 지정하지 않아도 해당 메시지 타입의 topic이 하나뿐이면
+    자동으로 선택되고, 여러 개면 사용 가능한 topic 목록과 함께
+    ValueError를 냅니다.
+  - **`--config` YAML에 `camera.source`/`lidar.source: rosbag` 선택자
+    추가.** `rosbag_path`(+선택적 `topic`)를 지정하면 됩니다. `camera`와
+    `lidar`를 서로 다른 소스로 섞어 쓰는 것도 가능합니다(예: 카메라는
+    rosbag, LiDAR는 `pcd_dir`). `source` 키를 생략하면 기존 동작
+    (`image_dir`/`pcd_dir`)과 완전히 동일해서 기존 config 파일은 수정
+    없이 그대로 동작합니다.
+  - **여전히 지원하지 않는 것: 살아있는 `ros_topic` 구독.** bag 파일을
+    읽는 것과 실행 중인 ROS 노드를 구독하는 것은 근본적으로 다른
+    문제입니다 — 후자는 실시간 ROS2 미들웨어/DDS 연결이 필요하고,
+    `rosbags` 라이브러리(오프라인 bag 리더)로는 해결할 수 없는
+    영역이라 이 툴의 스코프 밖으로 남겨뒀습니다.
+  - 검증: `rosbags.rosbag2.Writer`로 만든 합성 bag으로 왕복 테스트(포인트
+    좌표/intensity/이미지 픽셀/타임스탬프 정확히 일치 확인), 그리고
+    **동일한 합성 장면을 `pcd_dir`/`image_dir`로 읽은 결과와 `rosbag`으로
+    읽은 결과가 완전히 동일한 Overall Quality를 내는지** 비교하는
+    end-to-end 테스트로 두 로딩 경로의 동등성을 확인했습니다. CI의
+    `test` job도 `pip install -e ".[rosbag]"`로 바꿔서 이 코드가 매
+    PR마다 실제로 검증되도록 했습니다.
+  - `tests/test_lidar.py` +8, `tests/test_camera.py` +4,
+    `tests/test_cli.py` +5 (총 20개 테스트 파일, 276개 테스트로 증가).
+
+### CI / 개발 도구 (CI / Tooling)
+
+- **CI에 lint job 추가.** `.github/workflows/ci.yaml`에 `ruff check .`를
+  돌리는 별도 `lint` job을 추가했습니다(Python 버전 매트릭스와 무관하게
+  한 번만 실행). `[tool.ruff]` 설정은 의도적으로 pyflakes 동급 규칙셋
+  (`F`)만 켰습니다 — import 정렬, `Optional[X]` → `X | None` 같은
+  스타일 규칙까지 켜면 이 코드베이스의 기존 컨벤션과 충돌해서 175개
+  가까이 걸리는데, 그건 아무도 안 읽는 노이즈가 될 뿐입니다. 이 작업
+  과정에서 `tests/` 아래 미사용 import 8개(이전 세션에서 정리할 때
+  `tests/`를 스캔 대상에서 빼먹었음)를 추가로 찾아 정리했습니다.
+  `ruff>=0.6`을 `dev` extras에 추가.
+- **CI Python 매트릭스에 3.13 추가.** `["3.10", "3.11", "3.12", "3.13"]`.
+  numpy/scipy/matplotlib/PyYAML은 PyPI에 cp313 휠이 이미 있고,
+  opencv-python은 `cp37-abi3`(stable ABI) 태그로 배포돼 있어 3.13에서도
+  그대로 설치됩니다 — `pip download --python-version 313`으로 직접
+  확인.
+- **CI에 pip 의존성 캐싱 추가.** `actions/setup-python`의 `cache: pip`
+  옵션을 lint/test 두 job 모두에 적용해 매 실행마다 numpy/opencv/scipy/
+  matplotlib를 새로 받는 시간을 줄였습니다.
+- **`--version` 플래그 추가.** `importlib.metadata`로 `pyproject.toml`의
+  실제 설치된 버전을 동적으로 읽어오므로(하드코딩된 버전 문자열 없음)
+  둘이 어긋날 일이 없습니다.
+- **`--json-only` 플래그 추가.** `report.html` 생성(및 그 안에 들어갈
+  overlay/trajectory/histogram 시각 자료 생성)을 완전히 건너뛰고
+  `report.json`만 씁니다. `--no-visuals`는 이미지 임베드만 건너뛰고
+  HTML 자체는 항상 만들었는데, `--fail-on-bad`/`--fail-on-partial`
+  게이트로만 쓰는 CI 파이프라인에서는 아무도 열어보지 않는 HTML을
+  만드는 시간 자체가 아깝기 때문입니다. `--fail-on-bad`/
+  `--fail-on-partial`과 자유롭게 조합 가능합니다.
+- `python -m app.cli --help`에 `--config` YAML 스키마 전체가 epilog로
+  표시되도록 이미 지난 커밋에서 추가되어 있었는데, 여기에 `--version`/
+  `--json-only` 플래그도 함께 반영되었습니다.
+
+### 문서 (Documentation)
+
+- **`evaluation_metric_spec.md` 복원.** 코드베이스 전체(10개 넘는 소스
+  파일의 docstring)에서 "설계 근거"로 인용되지만 저장소에는 커밋된 적이
+  없던 문서를, 그 인용들을 취합해 실제 구현과 정확히 일치하도록
+  재구성해 추가했습니다. 문서에 적힌 모든 threshold/상수는 실제 코드
+  값과 하나하나 대조 검증했습니다. 원본이 아니라 복원본이라는 점을
+  문서 맨 위와 README에 명시했습니다.
+
+### 개선 (Improved)
+
+- **`--config` YAML에 스키마 검증 추가, 에러 메시지를 실행 가능하게
+  개선.** 이전에는 필수 키가 하나만 빠져도 `error: failed to load
+  dataset: 'camera'`처럼 raw `KeyError`가 그대로 노출되어, 무엇이
+  문제인지는 알려줘도 어디를 봐야 하는지는 알려주지 않았습니다.
+  이제 `load_dataset_from_config()`가 로더를 실행하기 전에 스키마
+  전체를 한 번에 검사해서, **발견된 모든 문제를 한 번에 나열**하고
+  (첫 번째 문제에서 멈추지 않음) 스키마 문서(`--help`의 epilog,
+  `app/cli.py` docstring, `evaluation_metric_spec.md`) 위치를 안내하는
+  `ConfigSchemaError`를 raise합니다. 검사 항목: 필수 top-level/nested
+  키 존재 여부, 컨테이너 타입(mapping이어야 하는 곳에 list가 온 경우
+  등), `rotation_format`/`parent`/`child` 같은 enum류 필드의 허용값
+  검증.
+  - `python -m app.cli --help`에 이제 `--config` YAML 스키마 전체가
+    epilog로 표시됩니다(이전에는 모듈 docstring에만 있어서 `--help`
+    로는 확인할 수 없었습니다).
+  - 값 자체의 타당성(예: `image_dir`가 실제 존재하는 디렉토리인지,
+    intrinsics가 물리적으로 그럴듯한지)까지는 검사하지 않습니다 —
+    그건 각 로더가 이미 하고 있고, 이미 읽을 만한 에러를 냅니다.
+    이 검증은 "필수 키가 있는가/구조가 맞는가"만 다룹니다.
+
 ### 성능 개선 (Performance)
 
 - **`extract_lidar_edge_points` (M2의 핵심 연산 경로)를 두 단계에 걸쳐

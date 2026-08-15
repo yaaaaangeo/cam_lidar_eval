@@ -7,12 +7,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from quality.quality_score import compute_quality_score, DEFAULT_WEIGHTS
-from evaluation.edge_alignment import evaluate_edge_alignment, EdgeAlignmentResult
+from evaluation.edge_alignment import evaluate_edge_alignment
 from evaluation.holdout_consistency import evaluate_holdout_consistency
 from evaluation.multiframe_consistency import evaluate_multiframe_consistency
 
 from tests.test_holdout_consistency import (
-    _make_dataset, _make_lidar_spec, _make_camera, _make_image, _make_base_points_cam_frame,
+    _make_dataset, _make_lidar_spec, _make_camera, _make_base_points_cam_frame,
 )
 
 

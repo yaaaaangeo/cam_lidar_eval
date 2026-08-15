@@ -249,11 +249,200 @@ def test_lidar_frame_load_dispatches_by_extension():
         shutil.rmtree(tmpdir)
 
 
-def test_rosbag_lidar_loader_raises_not_implemented():
+# ---------------------------------------------------------------------------
+# rosbag loader (requires the optional `rosbags` package -- if it isn't
+# installed, these tests are skipped rather than failing, since rosbag
+# support is opt-in: `pip install "cam-lidar-eval[rosbag]"`)
+# ---------------------------------------------------------------------------
+
+try:
+    from rosbags.rosbag2 import Writer as _Rosbag2Writer
+    from rosbags.typesys import Stores as _RosbagStores, get_typestore as _get_rosbag_typestore
+    _ROSBAGS_AVAILABLE = True
+except ImportError:
+    _ROSBAGS_AVAILABLE = False
+
+
+def _write_pointcloud2_bag(bag_path, frames, topic="/lidar/points", with_intensity=False):
+    """
+    Write a synthetic rosbag2 containing one sensor_msgs/msg/PointCloud2
+    message per frame. `frames` is a list of (points, stamp_sec,
+    stamp_nanosec, bag_timestamp_ns) tuples; points is an (N,3) or (N,4)
+    array (x,y,z[,intensity]), used to build the corresponding
+    PointField layout so this exercises the same field-offset-driven
+    parsing path _pointcloud2_to_array() uses for real sensor data.
+    """
+    ts = _get_rosbag_typestore(_RosbagStores.ROS2_HUMBLE)
+    PointField = ts.types["sensor_msgs/msg/PointField"]
+    PointCloud2 = ts.types["sensor_msgs/msg/PointCloud2"]
+    Header = ts.types["std_msgs/msg/Header"]
+    Time = ts.types["builtin_interfaces/msg/Time"]
+
+    if with_intensity:
+        fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(name="intensity", offset=12, datatype=PointField.FLOAT32, count=1),
+        ]
+        point_step = 16
+    else:
+        fields = [
+            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
+        ]
+        point_step = 12
+
+    with _Rosbag2Writer(bag_path, version=9) as writer:
+        conn = writer.add_connection(topic, PointCloud2.__msgtype__, typestore=ts)
+        for points, stamp_sec, stamp_nanosec, bag_ts_ns in frames:
+            points = np.asarray(points, dtype=np.float32)
+            n = points.shape[0]
+            header = Header(stamp=Time(sec=stamp_sec, nanosec=stamp_nanosec), frame_id="lidar")
+            msg = PointCloud2(
+                header=header, height=1, width=n, fields=fields,
+                is_bigendian=False, point_step=point_step, row_step=point_step * n,
+                data=np.frombuffer(points.tobytes(), dtype=np.uint8), is_dense=True,
+            )
+            raw = ts.serialize_cdr(msg, PointCloud2.__msgtype__)
+            writer.write(conn, bag_ts_ns, raw)
+
+
+def test_rosbag_lidar_loader_reads_points_and_timestamps():
+    if not _ROSBAGS_AVAILABLE:
+        return  # opt-in dependency not installed; nothing to test here
+    tmpdir = tempfile.mkdtemp()
     try:
-        load_lidar_from_rosbag()
-        assert False
-    except NotImplementedError:
+        bag_path = os.path.join(tmpdir, "bag")
+        pts = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+        _write_pointcloud2_bag(bag_path, [(pts, 10, 500_000_000, 10_500_000_000)])
+
+        spec = LidarSensorSpec(horizontal_resolution_deg=0.2, range_accuracy_m=0.02)
+        result = load_lidar_from_rosbag(bag_path, spec)
+
+        assert result.lidar.source.kind == "rosbag"
+        assert result.lidar.source.topic == "/lidar/points"
+        assert len(result.frames) == 1
+        assert result.frames[0].timestamp == 10.5  # sec + nanosec/1e9, from header.stamp
+        np.testing.assert_allclose(result.frames[0].points, pts)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_lidar_loader_reads_intensity_field():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bag_path = os.path.join(tmpdir, "bag")
+        pts = [[1.0, 2.0, 3.0, 0.75]]
+        _write_pointcloud2_bag(bag_path, [(pts, 1, 0, 1_000_000_000)], with_intensity=True)
+
+        spec = LidarSensorSpec()
+        result = load_lidar_from_rosbag(bag_path, spec)
+        assert result.frames[0].points.shape == (1, 4)
+        np.testing.assert_allclose(result.frames[0].points, pts)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_lidar_loader_multiple_frames_sorted_by_timestamp():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bag_path = os.path.join(tmpdir, "bag")
+        # write out of chronological order -- loader should sort by timestamp
+        frames = [
+            ([[3.0, 3.0, 3.0]], 3, 0, 3_000_000_000),
+            ([[1.0, 1.0, 1.0]], 1, 0, 1_000_000_000),
+            ([[2.0, 2.0, 2.0]], 2, 0, 2_000_000_000),
+        ]
+        _write_pointcloud2_bag(bag_path, frames)
+
+        spec = LidarSensorSpec()
+        result = load_lidar_from_rosbag(bag_path, spec)
+        assert [fr.timestamp for fr in result.frames] == [1.0, 2.0, 3.0]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_lidar_loader_unstamped_header_falls_back_to_bag_time_with_warning():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bag_path = os.path.join(tmpdir, "bag")
+        # stamp_sec=0, stamp_nanosec=0 -> unstamped; bag_ts_ns=7.25e9 should be used instead
+        _write_pointcloud2_bag(bag_path, [([[0.0, 0.0, 0.0]], 0, 0, 7_250_000_000)])
+
+        spec = LidarSensorSpec()
+        result = load_lidar_from_rosbag(bag_path, spec)
+        assert abs(result.frames[0].timestamp - 7.25) < 1e-6
+        assert any("unstamped header" in w for w in result.warnings)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_lidar_loader_missing_topic_raises_value_error():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bag_path = os.path.join(tmpdir, "bag")
+        _write_pointcloud2_bag(bag_path, [([[1.0, 2.0, 3.0]], 1, 0, 1_000_000_000)],
+                                topic="/lidar/points")
+        spec = LidarSensorSpec()
+        try:
+            load_lidar_from_rosbag(bag_path, spec, topic="/wrong/topic")
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "/wrong/topic" in str(e)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_lidar_loader_ambiguous_topic_without_selection_raises():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bag_path = os.path.join(tmpdir, "bag")
+        ts = _get_rosbag_typestore(_RosbagStores.ROS2_HUMBLE)
+        PointField = ts.types["sensor_msgs/msg/PointField"]
+        PointCloud2 = ts.types["sensor_msgs/msg/PointCloud2"]
+        Header = ts.types["std_msgs/msg/Header"]
+        Time = ts.types["builtin_interfaces/msg/Time"]
+        fields = [PointField(name=n, offset=o, datatype=PointField.FLOAT32, count=1)
+                  for n, o in [("x", 0), ("y", 4), ("z", 8)]]
+        pts = np.array([[1.0, 2.0, 3.0]], dtype=np.float32)
+        with _Rosbag2Writer(bag_path, version=9) as writer:
+            for topic in ("/lidar/front", "/lidar/rear"):
+                conn = writer.add_connection(topic, PointCloud2.__msgtype__, typestore=ts)
+                header = Header(stamp=Time(sec=1, nanosec=0), frame_id="lidar")
+                msg = PointCloud2(header=header, height=1, width=1, fields=fields,
+                                   is_bigendian=False, point_step=12, row_step=12,
+                                   data=np.frombuffer(pts.tobytes(), dtype=np.uint8), is_dense=True)
+                writer.write(conn, 1_000_000_000, ts.serialize_cdr(msg, PointCloud2.__msgtype__))
+
+        spec = LidarSensorSpec()
+        try:
+            load_lidar_from_rosbag(bag_path, spec)  # no topic specified -> ambiguous
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "/lidar/front" in str(e) and "/lidar/rear" in str(e)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_lidar_loader_missing_path_raises_file_not_found():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    try:
+        load_lidar_from_rosbag("/definitely/does/not/exist", LidarSensorSpec())
+        assert False, "expected FileNotFoundError"
+    except FileNotFoundError:
         pass
 
 

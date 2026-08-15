@@ -1,5 +1,4 @@
 # Evaluation Metric Spec — Cam–LiDAR Calibration Evaluation Tool
-
 ## 0. 목적
 
 **이미 존재하는** camera–LiDAR extrinsic calibration(`T_CL`)의 품질을

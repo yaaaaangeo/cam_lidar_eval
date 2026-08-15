@@ -24,7 +24,12 @@ Config YAML schema (mirrors the Input Loader Spec in
 evaluation_metric_spec.md):
 
   camera:
-    image_dir: path/to/images
+    source: image_dir                 # optional, default: image_dir. Or: rosbag
+    image_dir: path/to/images         # required if source == image_dir
+    # rosbag_path: path/to/bag        # required if source == rosbag (rosbag1
+    #                                  # .bag file or rosbag2 directory)
+    # topic: /camera/image_raw        # optional if source == rosbag and the bag
+    #                                  # has exactly one Image/CompressedImage topic
     width: 1920
     height: 1080
     model: pinhole            # or fisheye
@@ -33,7 +38,11 @@ evaluation_metric_spec.md):
     edge_localization_floor_px: 0.5   # optional
 
   lidar:
-    pcd_dir: path/to/pointclouds
+    source: pcd_dir                   # optional, default: pcd_dir. Or: rosbag
+    pcd_dir: path/to/pointclouds      # required if source == pcd_dir (.pcd or .ply)
+    # rosbag_path: path/to/bag        # required if source == rosbag
+    # topic: /lidar/points            # optional if source == rosbag and the bag
+    #                                  # has exactly one PointCloud2 topic
     sensor_spec:
       horizontal_resolution_deg: 0.2   # optional (see fallback rules in spec)
       vertical_resolution_deg: 0.2     # optional
@@ -61,6 +70,14 @@ evaluation_metric_spec.md):
     frame_index: null                 # which frame M2's headline number comes from;
                                        # null -> the temporally-middle frame
     weights: null                     # e.g. {geometry: 0.5, generalization: 0.25, stability: 0.25}
+
+rosbag source note: reading rosbag1 (.bag) or rosbag2 (directory) files
+requires the optional `rosbags` (+ `rosbags-image` for camera) dependency:
+    pip install "cam-lidar-eval[rosbag]"
+This is a pure-Python bag reader -- no ROS/rclpy installation is needed.
+Live `ros_topic` (subscribing to a running ROS node) is NOT supported --
+that needs an active ROS2 middleware/DDS connection, which is a
+categorically different thing from reading an already-recorded bag file.
 """
 
 from __future__ import annotations
@@ -73,8 +90,8 @@ from typing import Optional
 import numpy as np
 import yaml
 
-from input.camera import CameraIntrinsics, CameraDistortion, load_camera_from_image_dir
-from input.lidar import LidarSensorSpec, load_lidar_from_pcd_dir
+from input.camera import CameraIntrinsics, CameraDistortion, load_camera_from_image_dir, load_camera_from_rosbag
+from input.lidar import LidarSensorSpec, load_lidar_from_pcd_dir, load_lidar_from_rosbag
 from input.extrinsic import ExtrinsicRaw, load_extrinsic, verify_extrinsic
 from input.dataset import SyncConfig, build_dataset, EvaluationDataset, SyncedFrame
 
@@ -101,15 +118,153 @@ from report.html import write_html_report
 # Config loading (real-data path)
 # ---------------------------------------------------------------------------
 
+class ConfigSchemaError(ValueError):
+    """Raised when a --config YAML is missing required keys or has an
+    invalid structure. Carries a human-readable, actionable message (every
+    problem found, collected in one pass, plus a pointer to where the
+    schema is documented) instead of letting a raw KeyError/TypeError from
+    deep inside config parsing surface to the user."""
+
+
+_REQUIRED_TOP_LEVEL_KEYS = ("camera", "lidar", "extrinsic")
+_REQUIRED_CAMERA_KEYS = ("width", "height", "intrinsics")
+_REQUIRED_CAMERA_INTRINSICS_KEYS = ("fx", "fy", "cx", "cy")
+_REQUIRED_EXTRINSIC_KEYS = ("parent", "child", "rotation", "rotation_format")
+_VALID_ROTATION_FORMATS = ("rpy_deg", "rpy_rad", "quaternion", "matrix3x3", "matrix4x4")
+_VALID_EXTRINSIC_ROLES = ("lidar", "camera")
+_VALID_CAMERA_SOURCES = ("image_dir", "rosbag")
+_VALID_LIDAR_SOURCES = ("pcd_dir", "rosbag")
+
+_SCHEMA_POINTER = (
+    "See the full config schema in `python -m app.cli --help`'s epilog, "
+    "app/cli.py's module docstring, or evaluation_metric_spec.md's "
+    "Input Loader Spec."
+)
+
+
+def _validate_config_schema(cfg, config_path: str) -> None:
+    """
+    Check a parsed --config YAML against the schema documented in this
+    module's docstring, collecting every problem found in a single pass
+    (missing keys, wrong types, invalid enum values) instead of stopping at
+    the first one. Raises ConfigSchemaError with a bullet list naming every
+    problem and a pointer back to the schema, so a first-time --config user
+    isn't left staring at a bare "'camera'" KeyError with no idea what it
+    means or where to look.
+
+    This intentionally checks presence/shape only (required keys exist,
+    are the right container type, enum-like fields have an allowed value)
+    -- it does not validate values deeply (e.g. it doesn't check that
+    image_dir actually exists on disk, or that intrinsics are physically
+    plausible). Those are left to the loaders themselves, which already
+    raise their own specific, readable errors when they run.
+
+    camera.source / lidar.source select which loader is used
+    ("image_dir"/"rosbag" and "pcd_dir"/"rosbag" respectively, each
+    defaulting to the directory-based source if omitted for backward
+    compatibility with configs written before rosbag support existed).
+    Each source kind has its own required path key, checked conditionally
+    below rather than unconditionally requiring both.
+    """
+    problems: list[str] = []
+
+    if not isinstance(cfg, dict):
+        raise ConfigSchemaError(
+            f"'{config_path}' did not parse into a YAML mapping (got "
+            f"{type(cfg).__name__} instead). Expected top-level keys: "
+            f"{', '.join(_REQUIRED_TOP_LEVEL_KEYS)}. {_SCHEMA_POINTER}"
+        )
+
+    for key in _REQUIRED_TOP_LEVEL_KEYS:
+        if key not in cfg:
+            problems.append(f"missing top-level key '{key}'")
+
+    cam_cfg = cfg.get("camera")
+    if cam_cfg is not None:
+        if not isinstance(cam_cfg, dict):
+            problems.append("'camera' must be a mapping (e.g. `camera: {image_dir: ..., ...}`)")
+        else:
+            for key in _REQUIRED_CAMERA_KEYS:
+                if key not in cam_cfg:
+                    problems.append(f"missing 'camera.{key}'")
+            cam_source = cam_cfg.get("source", "image_dir")
+            if cam_source not in _VALID_CAMERA_SOURCES:
+                problems.append(
+                    f"'camera.source' is {cam_source!r}, must be one of {_VALID_CAMERA_SOURCES}"
+                )
+            elif cam_source == "image_dir" and "image_dir" not in cam_cfg:
+                problems.append("missing 'camera.image_dir' (required when camera.source is 'image_dir')")
+            elif cam_source == "rosbag" and "rosbag_path" not in cam_cfg:
+                problems.append("missing 'camera.rosbag_path' (required when camera.source is 'rosbag')")
+            if "intrinsics" in cam_cfg:
+                intrinsics_cfg = cam_cfg["intrinsics"]
+                if not isinstance(intrinsics_cfg, dict):
+                    problems.append("'camera.intrinsics' must be a mapping with fx/fy/cx/cy")
+                else:
+                    for key in _REQUIRED_CAMERA_INTRINSICS_KEYS:
+                        if key not in intrinsics_cfg:
+                            problems.append(f"missing 'camera.intrinsics.{key}'")
+
+    lidar_cfg = cfg.get("lidar")
+    if lidar_cfg is not None:
+        if not isinstance(lidar_cfg, dict):
+            problems.append("'lidar' must be a mapping (e.g. `lidar: {pcd_dir: ...}`)")
+        else:
+            lidar_source = lidar_cfg.get("source", "pcd_dir")
+            if lidar_source not in _VALID_LIDAR_SOURCES:
+                problems.append(
+                    f"'lidar.source' is {lidar_source!r}, must be one of {_VALID_LIDAR_SOURCES}"
+                )
+            elif lidar_source == "pcd_dir" and "pcd_dir" not in lidar_cfg:
+                problems.append("missing 'lidar.pcd_dir' (required when lidar.source is 'pcd_dir')")
+            elif lidar_source == "rosbag" and "rosbag_path" not in lidar_cfg:
+                problems.append("missing 'lidar.rosbag_path' (required when lidar.source is 'rosbag')")
+
+    ext_cfg = cfg.get("extrinsic")
+    if ext_cfg is not None:
+        if not isinstance(ext_cfg, dict):
+            problems.append("'extrinsic' must be a mapping")
+        else:
+            for key in _REQUIRED_EXTRINSIC_KEYS:
+                if key not in ext_cfg:
+                    problems.append(f"missing 'extrinsic.{key}'")
+            if "rotation_format" in ext_cfg and ext_cfg["rotation_format"] not in _VALID_ROTATION_FORMATS:
+                problems.append(
+                    f"'extrinsic.rotation_format' is {ext_cfg['rotation_format']!r}, "
+                    f"must be one of {_VALID_ROTATION_FORMATS}"
+                )
+            for role_key in ("parent", "child"):
+                if role_key in ext_cfg and ext_cfg[role_key] not in _VALID_EXTRINSIC_ROLES:
+                    problems.append(
+                        f"'extrinsic.{role_key}' is {ext_cfg[role_key]!r}, "
+                        f"must be one of {_VALID_EXTRINSIC_ROLES}"
+                    )
+
+    if problems:
+        bullet_list = "\n".join(f"  - {p}" for p in problems)
+        raise ConfigSchemaError(
+            f"'{config_path}' does not match the expected schema:\n"
+            f"{bullet_list}\n{_SCHEMA_POINTER}"
+        )
+
+
 def load_dataset_from_config(config_path: str) -> tuple[EvaluationDataset, dict, list[str]]:
     """Parse a YAML config per the schema in this module's docstring and
     build a synced EvaluationDataset. Returns (dataset, evaluation_config,
     warnings) -- warnings collects everything the loaders themselves
     surfaced (missing sensor specs, non-numeric filenames, sync drops,
     extrinsic sanity issues), so the caller can fold them into the report
-    rather than losing them."""
+    rather than losing them.
+
+    Raises ConfigSchemaError (with a full list of problems and a pointer to
+    the schema) if required keys are missing or malformed, before any
+    loader runs -- so a config typo fails fast with an actionable message
+    rather than surfacing as a bare KeyError from wherever it happened to
+    be first dereferenced."""
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
+
+    _validate_config_schema(cfg, config_path)
 
     warnings: list[str] = []
 
@@ -117,17 +272,32 @@ def load_dataset_from_config(config_path: str) -> tuple[EvaluationDataset, dict,
     intrinsics = CameraIntrinsics(**cam_cfg["intrinsics"])
     dist_cfg = cam_cfg.get("distortion", {"model": "none"})
     distortion = CameraDistortion(model=dist_cfg.get("model", "none"), coeffs=dist_cfg.get("coeffs", {}))
-    cam_result = load_camera_from_image_dir(
-        cam_cfg["image_dir"], width=cam_cfg["width"], height=cam_cfg["height"],
-        model=cam_cfg.get("model", "pinhole"), intrinsics=intrinsics, distortion=distortion,
-        timestamp_source=cam_cfg.get("timestamp_source", "filename"),
-        edge_localization_floor_px=cam_cfg.get("edge_localization_floor_px"),
-    )
+    cam_source = cam_cfg.get("source", "image_dir")
+    if cam_source == "rosbag":
+        cam_result = load_camera_from_rosbag(
+            cam_cfg["rosbag_path"], width=cam_cfg["width"], height=cam_cfg["height"],
+            model=cam_cfg.get("model", "pinhole"), intrinsics=intrinsics, distortion=distortion,
+            topic=cam_cfg.get("topic"),
+            edge_localization_floor_px=cam_cfg.get("edge_localization_floor_px"),
+        )
+    else:
+        cam_result = load_camera_from_image_dir(
+            cam_cfg["image_dir"], width=cam_cfg["width"], height=cam_cfg["height"],
+            model=cam_cfg.get("model", "pinhole"), intrinsics=intrinsics, distortion=distortion,
+            timestamp_source=cam_cfg.get("timestamp_source", "filename"),
+            edge_localization_floor_px=cam_cfg.get("edge_localization_floor_px"),
+        )
     warnings.extend(f"[camera] {w}" for w in cam_result.warnings)
 
     lidar_cfg = cfg["lidar"]
     sensor_spec = LidarSensorSpec(**lidar_cfg.get("sensor_spec", {}))
-    lidar_result = load_lidar_from_pcd_dir(lidar_cfg["pcd_dir"], sensor_spec)
+    lidar_source = lidar_cfg.get("source", "pcd_dir")
+    if lidar_source == "rosbag":
+        lidar_result = load_lidar_from_rosbag(
+            lidar_cfg["rosbag_path"], sensor_spec, topic=lidar_cfg.get("topic"),
+        )
+    else:
+        lidar_result = load_lidar_from_pcd_dir(lidar_cfg["pcd_dir"], sensor_spec)
     warnings.extend(f"[lidar] {w}" for w in lidar_result.warnings)
 
     ext_cfg = cfg["extrinsic"]
@@ -261,21 +431,34 @@ def run_pipeline(
     frame_index: Optional[int] = None,
     weights: Optional[dict] = None,
     no_visuals: bool = False,
+    json_only: bool = False,
     advanced: bool = False,
     extra_warnings: Optional[list[str]] = None,
 ) -> dict:
     """Run M0/M2/M3/M4 + quality scoring + visuals + report writing for a
     built EvaluationDataset. Returns the report dict (already written to
-    disk as JSON+HTML in output_dir).
+    disk in output_dir -- report.json always, report.html unless
+    json_only=True).
 
     advanced: if True, also runs the Phase-5 diagnostics (Plane Consistency,
     Perturbation Sensitivity, Temporal Drift) and attaches them to the
     report's 'advanced' section. These never affect quality_score -- they're
     supplementary, not part of the MVP scored set -- and cost noticeably
     more time (perturbation alone re-runs M2 roughly 24 times), so they're
-    opt-in rather than the default."""
+    opt-in rather than the default.
+
+    json_only: if True, skip both visual generation (overlay/trajectory/
+    histogram PNGs, same as no_visuals) AND HTML report assembly/writing
+    entirely -- only report.json is produced. For CI gates (--fail-on-bad/
+    --fail-on-partial) that only ever read the JSON, this avoids spending
+    time building and writing an HTML file nobody opens. Implies
+    no_visuals (visuals would just be discarded unused if HTML isn't
+    written), so passing no_visuals=False alongside json_only=True has no
+    effect -- visuals are skipped either way."""
     if not dataset.frames:
         raise ValueError("Dataset has no synced frames; nothing to evaluate.")
+
+    skip_visuals = no_visuals or json_only
 
     lidar_spec = dataset.lidar.sensor_spec
     edge_kwargs = {"depth_jump_threshold_m": depth_jump_threshold_m, "edge_radius_px": edge_radius_px}
@@ -307,7 +490,7 @@ def run_pipeline(
         temporal_drift_result = evaluate_temporal_drift(m4)
 
     visuals = {}
-    if not no_visuals:
+    if not skip_visuals:
         overlay_img = render_overlay_from_result(image, m2)
         if overlay_img is not None:
             visuals["overlay_png"] = encode_png(overlay_img)
@@ -328,7 +511,8 @@ def run_pipeline(
 
     os.makedirs(output_dir, exist_ok=True)
     write_json_report(report, os.path.join(output_dir, "report.json"))
-    write_html_report(report, os.path.join(output_dir, "report.html"), visuals=visuals)
+    if not json_only:
+        write_html_report(report, os.path.join(output_dir, "report.html"), visuals=visuals)
 
     return report
 
@@ -337,7 +521,7 @@ def run_pipeline(
 # Console summary
 # ---------------------------------------------------------------------------
 
-def print_console_summary(report: dict, output_dir: str) -> None:
+def print_console_summary(report: dict, output_dir: str, json_only: bool = False) -> None:
     q = report["quality_score"]
     m0 = report["m0_sanity_gate"]
     width = 58
@@ -380,8 +564,11 @@ def print_console_summary(report: dict, output_dir: str) -> None:
     n_warnings = len(report.get("warnings", []))
     if n_warnings:
         print(f" {n_warnings} warning(s) -- see report for details.")
-    print(f" Report written to: {os.path.join(output_dir, 'report.html')}")
-    print(f"                    {os.path.join(output_dir, 'report.json')}")
+    if json_only:
+        print(f" Report written to: {os.path.join(output_dir, 'report.json')}")
+    else:
+        print(f" Report written to: {os.path.join(output_dir, 'report.html')}")
+        print(f"                    {os.path.join(output_dir, 'report.json')}")
     print(sep)
 
 
@@ -389,13 +576,91 @@ def print_console_summary(report: dict, output_dir: str) -> None:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+_CONFIG_SCHEMA_EPILOG = """\
+--config YAML schema (mirrors the Input Loader Spec in evaluation_metric_spec.md):
+
+  camera:
+    source: image_dir                 # optional, default: image_dir. Or: rosbag
+    image_dir: path/to/images         # required if source == image_dir
+    # rosbag_path: path/to/bag        # required if source == rosbag
+    # topic: /camera/image_raw        # optional if bag has exactly one image topic
+    width: 1920
+    height: 1080
+    model: pinhole            # or fisheye
+    intrinsics: {fx: ..., fy: ..., cx: ..., cy: ...}
+    distortion: {model: plumb_bob, coeffs: {k1: ..., k2: ..., p1: ..., p2: ...}}
+    edge_localization_floor_px: 0.5   # optional
+
+  lidar:
+    source: pcd_dir                   # optional, default: pcd_dir. Or: rosbag
+    pcd_dir: path/to/pointclouds      # required if source == pcd_dir
+    # rosbag_path: path/to/bag        # required if source == rosbag
+    # topic: /lidar/points            # optional if bag has exactly one PointCloud2 topic
+    sensor_spec:
+      horizontal_resolution_deg: 0.2   # optional (see fallback rules in spec)
+      vertical_resolution_deg: 0.2     # optional
+      channels: 32                    # optional, used if vertical_resolution_deg absent
+      vertical_fov_deg: 40.0          # optional, used with channels
+      range_accuracy_m: 0.02          # optional
+      min_range_m: 0.1
+      max_range_m: 200.0
+
+  extrinsic:
+    parent: lidar                     # or camera
+    child: camera                     # or lidar
+    translation: [0.1, -0.05, 0.2]
+    rotation: [0.0, 0.0, 0.0]         # meaning depends on rotation_format
+    rotation_format: rpy_deg          # rpy_deg | rpy_rad | quaternion | matrix3x3 | matrix4x4
+    unit: m                           # m | cm | mm
+
+  evaluation:                         # all optional, shown with defaults
+    sync_max_time_diff_ms: 50.0
+    n_blocks: 4
+    min_frames_per_block: 30
+    min_frames_m4: 30
+    depth_jump_threshold_m: 0.3
+    edge_radius_px: 3.0
+    frame_index: null                 # which frame M2's headline number comes from;
+                                       # null -> the temporally-middle frame
+    weights: null                     # e.g. {geometry: 0.5, generalization: 0.25, stability: 0.25}
+
+rosbag source: requires `pip install "cam-lidar-eval[rosbag]"` (a pure-Python
+rosbag1/rosbag2 reader -- no ROS/rclpy installation needed). Live `ros_topic`
+sources are NOT supported (that needs an active ROS2 middleware connection).
+
+Only camera/lidar/extrinsic's non-comment keys above are required; everything
+marked "optional" (including the whole `evaluation:` block) may be omitted.
+"""
+
+
+def _get_version() -> str:
+    """Read the installed package version (from pyproject.toml's
+    [project].version, via installed package metadata) so --version can't
+    drift out of sync with a hardcoded string here. Falls back to
+    "unknown" when running from a source checkout that was never
+    `pip install`-ed (importlib.metadata needs installed package metadata,
+    not just the source files, to resolve a version)."""
+    try:
+        from importlib.metadata import version, PackageNotFoundError
+        try:
+            return version("cam-lidar-eval")
+        except PackageNotFoundError:
+            return "unknown (not installed -- run `pip install -e .`)"
+    except ImportError:  # pragma: no cover -- importlib.metadata is stdlib since 3.8
+        return "unknown"
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cam-lidar-eval",
         description="GT-free quality evaluation for an EXISTING camera-LiDAR extrinsic calibration.",
+        epilog=_CONFIG_SCHEMA_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"%(prog)s {_get_version()}")
+
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--config", type=str, help="Path to a YAML config (see app/cli.py docstring for schema).")
+    source.add_argument("--config", type=str, help="Path to a YAML config (see --help's epilog below for the schema).")
     source.add_argument("--demo", action="store_true", help="Run against a built-in synthetic scene (no data required).")
 
     parser.add_argument("--scenario", choices=["good", "drift"], default="good",
@@ -417,6 +682,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weights", type=str, default=None,
                          help="Override category weights, e.g. 'geometry=0.5,generalization=0.25,stability=0.25'.")
     parser.add_argument("--no-visuals", action="store_true", help="Skip generating overlay/trajectory/histogram images.")
+    parser.add_argument("--json-only", action="store_true",
+                         help="Skip generating report.html entirely (and its visuals, same as --no-visuals) -- "
+                              "only report.json is written. For CI gates (--fail-on-bad/--fail-on-partial) that "
+                              "only ever read the JSON, this saves the time spent building an HTML file nobody opens.")
     parser.add_argument("--advanced", action="store_true",
                          help="Also run Phase-5 advanced diagnostics (Plane Consistency, Perturbation "
                               "Sensitivity, Temporal Drift). Slower -- perturbation alone re-runs M2 "
@@ -475,14 +744,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             n_blocks=args.n_blocks, min_frames_per_block=args.min_frames_per_block,
             min_frames_m4=args.min_frames_m4, depth_jump_threshold_m=args.depth_jump_threshold_m,
             edge_radius_px=args.edge_radius_px, frame_index=args.frame_index,
-            weights=weights, no_visuals=args.no_visuals, advanced=args.advanced,
+            weights=weights, no_visuals=args.no_visuals, json_only=args.json_only, advanced=args.advanced,
             extra_warnings=extra_warnings,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    print_console_summary(report, args.output_dir)
+    print_console_summary(report, args.output_dir, json_only=args.json_only)
 
     q = report["quality_score"]
     if args.fail_on_bad and q["overall_classification"] in ("BAD", "FAIL"):

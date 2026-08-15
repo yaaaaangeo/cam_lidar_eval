@@ -1,7 +1,6 @@
 import sys
 import os
 import tempfile
-import shutil
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -100,7 +99,6 @@ def test_run_pipeline_custom_weights_applied():
 
 
 def test_run_pipeline_raises_on_empty_dataset():
-    from input.dataset import EvaluationDataset, SyncConfig
     dataset = _build_demo_dataset("good", num_frames=1)
     dataset.frames = []
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -164,6 +162,50 @@ def test_main_demo_without_advanced_flag_omits_advanced_section():
         assert report["advanced"] is None
 
 
+# ---------------------------------------------------------------------------
+# --json-only
+# ---------------------------------------------------------------------------
+
+def test_main_json_only_skips_html_report():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = main(["--demo", "--demo-frames", "20", "--output-dir", tmpdir, "--json-only"])
+        assert code == 0
+        assert os.path.exists(os.path.join(tmpdir, "report.json"))
+        assert not os.path.exists(os.path.join(tmpdir, "report.html"))
+
+
+def test_main_without_json_only_still_writes_html_report():
+    # sanity check: default behavior (no --json-only) is unchanged
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = main(["--demo", "--demo-frames", "20", "--output-dir", tmpdir, "--no-visuals"])
+        assert code == 0
+        assert os.path.exists(os.path.join(tmpdir, "report.json"))
+        assert os.path.exists(os.path.join(tmpdir, "report.html"))
+
+
+def test_main_json_only_combines_with_fail_on_partial():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = main(["--demo", "--scenario", "drift", "--demo-frames", "20",
+                     "--output-dir", tmpdir, "--json-only", "--fail-on-partial"])
+        assert code == 3
+        assert os.path.exists(os.path.join(tmpdir, "report.json"))
+        assert not os.path.exists(os.path.join(tmpdir, "report.html"))
+
+
+def test_run_pipeline_json_only_produces_no_visuals_in_report_dict():
+    # json_only implies no_visuals (visuals would be discarded unused
+    # anyway, since HTML is what embeds them) -- report.json itself
+    # doesn't carry a visuals section either way, but this exercises the
+    # code path directly to make sure json_only=True doesn't error out
+    # even when no_visuals is left at its default (False).
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dataset = _build_demo_dataset("good", num_frames=20)
+        report = run_pipeline(dataset, tmpdir, json_only=True)
+        assert os.path.exists(os.path.join(tmpdir, "report.json"))
+        assert not os.path.exists(os.path.join(tmpdir, "report.html"))
+        assert report["quality_score"]["overall_classification"] in ("GOOD", "WARNING", "BAD", "FAIL")
+
+
 def test_main_demo_drift_with_fail_on_bad_returns_nonzero():
     with tempfile.TemporaryDirectory() as tmpdir:
         code = main(["--demo", "--scenario", "drift", "--demo-frames", "20",
@@ -211,6 +253,88 @@ def test_main_demo_good_with_fail_on_partial_returns_zero():
 def test_main_missing_config_returns_one():
     code = main(["--config", "/definitely/does/not/exist.yaml", "--output-dir", "/tmp/x"])
     assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# --config schema validation (ConfigSchemaError)
+# ---------------------------------------------------------------------------
+
+def _write_yaml(tmpdir, contents: dict | list) -> str:
+    path = os.path.join(tmpdir, "config.yaml")
+    with open(path, "w") as f:
+        yaml.safe_dump(contents, f)
+    return path
+
+
+def test_load_dataset_from_config_missing_all_top_level_keys_lists_each_one():
+    # Regression test: a config missing required keys used to surface as a
+    # bare KeyError (e.g. just "'camera'") with no indication of what else
+    # was wrong or where the schema is documented. It should now name every
+    # missing top-level key in one pass.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = _write_yaml(tmpdir, {"unrelated": "stuff"})
+        try:
+            load_dataset_from_config(path)
+            assert False, "expected ConfigSchemaError"
+        except Exception as e:
+            msg = str(e)
+            assert "missing top-level key 'camera'" in msg
+            assert "missing top-level key 'lidar'" in msg
+            assert "missing top-level key 'extrinsic'" in msg
+            assert "evaluation_metric_spec.md" in msg  # points back to the schema
+
+
+def test_load_dataset_from_config_missing_nested_key_names_full_path():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = _write_yaml(tmpdir, {
+            "camera": {"image_dir": "x", "width": 640, "height": 480},  # no intrinsics
+            "lidar": {"pcd_dir": "y"},
+            "extrinsic": {"parent": "lidar", "child": "camera",
+                          "rotation": [0, 0, 0], "rotation_format": "rpy_deg"},
+        })
+        try:
+            load_dataset_from_config(path)
+            assert False, "expected ConfigSchemaError"
+        except Exception as e:
+            assert "missing 'camera.intrinsics'" in str(e)
+
+
+def test_load_dataset_from_config_invalid_rotation_format_is_named():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = _write_yaml(tmpdir, {
+            "camera": {"image_dir": "x", "width": 640, "height": 480,
+                       "intrinsics": {"fx": 1, "fy": 1, "cx": 1, "cy": 1}},
+            "lidar": {"pcd_dir": "y"},
+            "extrinsic": {"parent": "lidar", "child": "camera",
+                          "rotation": [0, 0, 0], "rotation_format": "rpy_degrees"},  # typo
+        })
+        try:
+            load_dataset_from_config(path)
+            assert False, "expected ConfigSchemaError"
+        except Exception as e:
+            assert "rotation_format" in str(e) and "rpy_degrees" in str(e)
+
+
+def test_load_dataset_from_config_non_mapping_top_level_is_rejected():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = _write_yaml(tmpdir, ["camera", "lidar"])  # a list, not a mapping
+        try:
+            load_dataset_from_config(path)
+            assert False, "expected ConfigSchemaError"
+        except Exception as e:
+            assert "did not parse into a YAML mapping" in str(e)
+
+
+def test_main_with_schema_invalid_config_returns_one_with_actionable_message():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = _write_yaml(tmpdir, {"unrelated": "stuff"})
+        import io
+        import contextlib
+        stderr_buf = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buf):
+            code = main(["--config", path, "--output-dir", os.path.join(tmpdir, "out")])
+        assert code == 1
+        assert "missing top-level key 'camera'" in stderr_buf.getvalue()
 
 
 def test_main_respects_min_frames_per_block_override_in_demo():
@@ -301,6 +425,170 @@ def test_main_config_end_to_end_with_real_files():
         assert code == 0
         assert os.path.exists(os.path.join(out_dir, "report.html"))
         assert os.path.exists(os.path.join(out_dir, "report.json"))
+
+
+# ---------------------------------------------------------------------------
+# --config with source: rosbag (requires the optional `rosbags` +
+# `rosbags-image` packages; skipped if not installed)
+# ---------------------------------------------------------------------------
+
+try:
+    from rosbags.rosbag2 import Writer as _Rosbag2Writer
+    from rosbags.typesys import Stores as _RosbagStores, get_typestore as _get_rosbag_typestore
+    from rosbags.image import message_to_cvimage as _rosbag_message_to_cvimage
+    _ROSBAGS_AVAILABLE = bool(_rosbag_message_to_cvimage)
+except ImportError:
+    _ROSBAGS_AVAILABLE = False
+
+
+def _write_rosbag_config_and_bag(tmpdir, num_frames=15):
+    """Same synthetic depth-step scene as _write_config_and_files, but
+    written into a single rosbag2 bag (one PointCloud2 + one Image message
+    per frame) instead of image_dir/pcd_dir, with a matching
+    source: rosbag config -- exercises the full --config -> rosbag loader
+    -> sync -> pipeline path end to end."""
+    ts = _get_rosbag_typestore(_RosbagStores.ROS2_HUMBLE)
+    PointField = ts.types["sensor_msgs/msg/PointField"]
+    PointCloud2 = ts.types["sensor_msgs/msg/PointCloud2"]
+    Image = ts.types["sensor_msgs/msg/Image"]
+    Header = ts.types["std_msgs/msg/Header"]
+    Time = ts.types["builtin_interfaces/msg/Time"]
+
+    width, height = 320, 240
+    image = np.zeros((height, width), dtype=np.uint8)
+    image[:, width // 2:] = 255
+    image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    fx = fy = 300.0
+    cx, cy = width / 2, height / 2
+    u_vals = np.linspace(0, width - 1, 80)
+    v_vals = np.linspace(0, height - 1, 60)
+    uu, vv = np.meshgrid(u_vals, v_vals)
+    uu, vv = uu.ravel(), vv.ravel()
+    zz = np.where(uu < cx, 5.0, 10.0)
+    xx = (uu - cx) * zz / fx
+    yy = (vv - cy) * zz / fy
+    pts = np.stack([xx, yy, zz], axis=1).astype(np.float32)
+
+    fields = [PointField(name=n, offset=o, datatype=PointField.FLOAT32, count=1)
+              for n, o in [("x", 0), ("y", 4), ("z", 8)]]
+
+    bag_path = os.path.join(tmpdir, "bag")
+    with _Rosbag2Writer(bag_path, version=9) as writer:
+        pc_conn = writer.add_connection("/lidar/points", PointCloud2.__msgtype__, typestore=ts)
+        img_conn = writer.add_connection("/camera/image_raw", Image.__msgtype__, typestore=ts)
+        for i in range(num_frames):
+            header = Header(stamp=Time(sec=i, nanosec=0), frame_id="lidar")
+            pc_msg = PointCloud2(header=header, height=1, width=len(pts), fields=fields,
+                                  is_bigendian=False, point_step=12, row_step=12 * len(pts),
+                                  data=np.frombuffer(pts.tobytes(), dtype=np.uint8), is_dense=True)
+            writer.write(pc_conn, i * 1_000_000_000, ts.serialize_cdr(pc_msg, PointCloud2.__msgtype__))
+
+            header2 = Header(stamp=Time(sec=i, nanosec=0), frame_id="camera")
+            img_msg = Image(header=header2, height=height, width=width, encoding="bgr8",
+                             is_bigendian=0, step=width * 3, data=image.flatten())
+            writer.write(img_conn, i * 1_000_000_000, ts.serialize_cdr(img_msg, Image.__msgtype__))
+
+    config = {
+        "camera": {
+            "source": "rosbag", "rosbag_path": bag_path, "topic": "/camera/image_raw",
+            "width": width, "height": height, "model": "pinhole",
+            "intrinsics": {"fx": fx, "fy": fy, "cx": cx, "cy": cy},
+            "distortion": {"model": "none"},
+        },
+        "lidar": {
+            "source": "rosbag", "rosbag_path": bag_path, "topic": "/lidar/points",
+            "sensor_spec": {"horizontal_resolution_deg": 0.05, "range_accuracy_m": 0.02},
+        },
+        "extrinsic": {
+            "parent": "lidar", "child": "camera",
+            "translation": [0.0, 0.0, 0.0], "rotation": [0.0, 0.0, 0.0],
+            "rotation_format": "rpy_deg", "unit": "m",
+        },
+        "evaluation": {"n_blocks": 3, "min_frames_per_block": 3, "min_frames_m4": num_frames,
+                       "depth_jump_threshold_m": 1.0},
+    }
+    config_path = os.path.join(tmpdir, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(config, f)
+    return config_path
+
+
+def test_load_dataset_from_config_rosbag_source():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = _write_rosbag_config_and_bag(tmpdir, num_frames=15)
+        dataset, eval_cfg, warnings = load_dataset_from_config(config_path)
+        assert len(dataset.frames) == 15
+        assert dataset.camera.source.kind == "rosbag"
+        assert dataset.lidar.source.kind == "rosbag"
+        assert np.allclose(dataset.extrinsic.T_CL, np.eye(4))
+
+
+def test_main_config_end_to_end_with_rosbag_source():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = _write_rosbag_config_and_bag(tmpdir, num_frames=15)
+        out_dir = os.path.join(tmpdir, "out")
+        code = main(["--config", config_path, "--output-dir", out_dir, "--no-visuals"])
+        assert code == 0
+        assert os.path.exists(os.path.join(out_dir, "report.json"))
+
+
+def test_rosbag_and_directory_sources_produce_equivalent_results():
+    # Both fixtures encode the exact same synthetic depth-step scene (same
+    # points, same image) -- just through different loaders (pcd_dir/
+    # image_dir vs rosbag). If the rosbag parsing path is correct, running
+    # the full pipeline through either source should produce the same
+    # Overall Quality classification and a near-identical score, proving
+    # the two source kinds are equivalent from the pipeline's point of
+    # view. (Not asserting a specific GOOD/WARNING/BAD/FAIL value here,
+    # since that depends on unrelated fixture tuning -- e.g. edge_radius_px
+    # vs point density -- not on which loader was used.)
+    if not _ROSBAGS_AVAILABLE:
+        return
+    with tempfile.TemporaryDirectory() as dir_tmpdir, tempfile.TemporaryDirectory() as bag_tmpdir:
+        dir_config_path = _write_config_and_files(dir_tmpdir, num_frames=15)
+        bag_config_path = _write_rosbag_config_and_bag(bag_tmpdir, num_frames=15)
+
+        dir_out = os.path.join(dir_tmpdir, "out")
+        bag_out = os.path.join(bag_tmpdir, "out")
+        assert main(["--config", dir_config_path, "--output-dir", dir_out, "--no-visuals"]) == \
+            main(["--config", bag_config_path, "--output-dir", bag_out, "--no-visuals"])
+
+        import json
+        with open(os.path.join(dir_out, "report.json")) as f:
+            dir_report = json.load(f)
+        with open(os.path.join(bag_out, "report.json")) as f:
+            bag_report = json.load(f)
+
+        assert dir_report["quality_score"]["overall_classification"] == \
+            bag_report["quality_score"]["overall_classification"]
+        dir_score = dir_report["quality_score"]["overall_score"]
+        bag_score = bag_report["quality_score"]["overall_score"]
+        if dir_score is not None and bag_score is not None:
+            assert abs(dir_score - bag_score) < 0.5
+
+
+def test_config_schema_rejects_rosbag_source_missing_rosbag_path():
+    config = {
+        "camera": {"source": "rosbag", "width": 640, "height": 480,
+                   "intrinsics": {"fx": 1, "fy": 1, "cx": 1, "cy": 1}},
+        "lidar": {"pcd_dir": "x"},
+        "extrinsic": {"parent": "lidar", "child": "camera",
+                      "rotation": [0, 0, 0], "rotation_format": "rpy_deg"},
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "config.yaml")
+        with open(path, "w") as f:
+            yaml.safe_dump(config, f)
+        try:
+            load_dataset_from_config(path)
+            assert False, "expected ConfigSchemaError"
+        except Exception as e:
+            assert "camera.rosbag_path" in str(e)
 
 
 if __name__ == "__main__":

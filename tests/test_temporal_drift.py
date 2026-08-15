@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from evaluation.temporal_drift import evaluate_temporal_drift
-from evaluation.multiframe_consistency import evaluate_multiframe_consistency, FrameResult, MultiFrameConsistencyResult
+from evaluation.multiframe_consistency import FrameResult, MultiFrameConsistencyResult
 
 
 def _make_fake_m4(mean_px_sequence, floor_px=1.0):

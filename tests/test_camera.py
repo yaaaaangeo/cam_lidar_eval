@@ -141,16 +141,136 @@ def test_camera_distortion_none_model_returns_none_coeffs():
     assert dist.as_array() is None
 
 
-def test_video_and_rosbag_loaders_raise_not_implemented():
+def test_video_loader_raises_not_implemented():
     try:
         load_camera_from_video()
         assert False
     except NotImplementedError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# rosbag loader (requires the optional `rosbags` + `rosbags-image` packages
+# -- if they aren't installed, these tests are skipped rather than failing,
+# since rosbag support is opt-in: `pip install "cam-lidar-eval[rosbag]"`)
+# ---------------------------------------------------------------------------
+
+try:
+    from rosbags.rosbag2 import Writer as _Rosbag2Writer
+    from rosbags.typesys import Stores as _RosbagStores, get_typestore as _get_rosbag_typestore
+    from rosbags.image import message_to_cvimage as _rosbag_message_to_cvimage
+    _ROSBAGS_AVAILABLE = bool(_rosbag_message_to_cvimage)  # also probes rosbags-image is installed
+except ImportError:
+    _ROSBAGS_AVAILABLE = False
+
+
+def _write_image_bag(bag_path, frames, topic="/camera/image_raw"):
+    """
+    Write a synthetic rosbag2 containing one sensor_msgs/msg/Image message
+    per frame. `frames` is a list of (bgr_image, stamp_sec, stamp_nanosec,
+    bag_timestamp_ns) tuples.
+    """
+    ts = _get_rosbag_typestore(_RosbagStores.ROS2_HUMBLE)
+    Image = ts.types["sensor_msgs/msg/Image"]
+    Header = ts.types["std_msgs/msg/Header"]
+    Time = ts.types["builtin_interfaces/msg/Time"]
+
+    with _Rosbag2Writer(bag_path, version=9) as writer:
+        conn = writer.add_connection(topic, Image.__msgtype__, typestore=ts)
+        for img, stamp_sec, stamp_nanosec, bag_ts_ns in frames:
+            img = np.asarray(img, dtype=np.uint8)
+            h, w = img.shape[:2]
+            header = Header(stamp=Time(sec=stamp_sec, nanosec=stamp_nanosec), frame_id="camera")
+            msg = Image(header=header, height=h, width=w, encoding="bgr8",
+                        is_bigendian=0, step=w * 3, data=img.flatten())
+            raw = ts.serialize_cdr(msg, Image.__msgtype__)
+            writer.write(conn, bag_ts_ns, raw)
+
+
+def test_rosbag_camera_loader_reads_image_and_timestamp():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    tmpdir = tempfile.mkdtemp()
     try:
-        load_camera_from_rosbag()
-        assert False
-    except NotImplementedError:
+        bag_path = os.path.join(tmpdir, "bag")
+        img = np.zeros((4, 6, 3), dtype=np.uint8)
+        img[:, :, 0] = 10
+        img[:, :, 1] = 20
+        img[:, :, 2] = 30
+        _write_image_bag(bag_path, [(img, 200, 250_000_000, 200_250_000_000)])
+
+        result = load_camera_from_rosbag(
+            bag_path, width=6, height=4, model="pinhole",
+            intrinsics=CameraIntrinsics(fx=500, fy=500, cx=3, cy=2),
+            distortion=CameraDistortion(model="none"),
+        )
+        assert result.camera.source.kind == "rosbag"
+        assert result.camera.source.topic == "/camera/image_raw"
+        assert len(result.frames) == 1
+        assert abs(result.frames[0].timestamp - 200.25) < 1e-6
+        assert result.frames[0].image.shape == (4, 6, 3)
+        np.testing.assert_array_equal(result.frames[0].image[0, 0], [10, 20, 30])
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_camera_loader_multiple_frames_sorted_by_timestamp():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bag_path = os.path.join(tmpdir, "bag")
+        blank = np.zeros((2, 2, 3), dtype=np.uint8)
+        frames = [
+            (blank, 3, 0, 3_000_000_000),
+            (blank, 1, 0, 1_000_000_000),
+            (blank, 2, 0, 2_000_000_000),
+        ]
+        _write_image_bag(bag_path, frames)
+
+        result = load_camera_from_rosbag(
+            bag_path, width=2, height=2, model="pinhole",
+            intrinsics=CameraIntrinsics(fx=1, fy=1, cx=1, cy=1),
+            distortion=CameraDistortion(model="none"),
+        )
+        assert [fr.timestamp for fr in result.frames] == [1.0, 2.0, 3.0]
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_camera_loader_missing_topic_raises_value_error():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    tmpdir = tempfile.mkdtemp()
+    try:
+        bag_path = os.path.join(tmpdir, "bag")
+        blank = np.zeros((2, 2, 3), dtype=np.uint8)
+        _write_image_bag(bag_path, [(blank, 1, 0, 1_000_000_000)], topic="/camera/image_raw")
+        try:
+            load_camera_from_rosbag(
+                bag_path, width=2, height=2, model="pinhole",
+                intrinsics=CameraIntrinsics(fx=1, fy=1, cx=1, cy=1),
+                distortion=CameraDistortion(model="none"),
+                topic="/wrong/topic",
+            )
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "/wrong/topic" in str(e)
+    finally:
+        shutil.rmtree(tmpdir)
+
+
+def test_rosbag_camera_loader_missing_path_raises_file_not_found():
+    if not _ROSBAGS_AVAILABLE:
+        return
+    try:
+        load_camera_from_rosbag(
+            "/definitely/does/not/exist", width=2, height=2, model="pinhole",
+            intrinsics=CameraIntrinsics(fx=1, fy=1, cx=1, cy=1),
+            distortion=CameraDistortion(model="none"),
+        )
+        assert False, "expected FileNotFoundError"
+    except FileNotFoundError:
         pass
 
 

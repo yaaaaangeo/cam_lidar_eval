@@ -18,6 +18,25 @@ python3 tests/test_edge_alignment.py # 파일 하나만
 모든 테스트 파일은 pytest 없이도 단독으로 동작하지만, 선호한다면
 `pytest tests/`도 그대로 사용할 수 있습니다.
 
+`tests/test_lidar.py`/`tests/test_camera.py`/`tests/test_cli.py`의
+rosbag 관련 테스트는 optional dependency인 `rosbags`가 설치되어 있을
+때만 실행되고, 없으면 조용히 스킵됩니다 (`pip install -e ".[rosbag]"`로
+설치).
+
+## Lint
+
+```bash
+pip install -e ".[dev]"
+ruff check .
+```
+
+CI에도 동일한 명령으로 도는 별도 `lint` job이 있습니다. `pyproject.toml`의
+`[tool.ruff]` 설정은 의도적으로 pyflakes 동급 규칙(`F`: 미사용 import,
+미정의 이름 등)만 켜뒀습니다 — import 정렬이나 타입힌트 스타일 같은
+opinionated 규칙까지 켜면 이 코드베이스의 기존 컨벤션과 계속 충돌해서
+노이즈가 되기 때문입니다. PR을 올리기 전에 로컬에서 한 번 돌려보는
+것을 권장합니다.
+
 ## 코드 구조
 
 디렉토리 구조 전체는 README의 "아키텍처" 섹션(§4)을 참고하세요. 기여하기

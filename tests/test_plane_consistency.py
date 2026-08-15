@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 
 from evaluation.plane_consistency import fit_plane_ransac, evaluate_plane_consistency
-from tests.test_holdout_consistency import _make_camera, _make_image, _make_lidar_spec
+from tests.test_holdout_consistency import _make_camera, _make_lidar_spec
 
 
 def _flat_plane_points(n=2000, seed=0, z0=5.0, noise=0.005):

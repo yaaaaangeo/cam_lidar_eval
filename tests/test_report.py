@@ -6,7 +6,6 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import math
-import numpy as np
 
 from report.builder import build_report, m0_summary
 from report.json import to_json_string, write_json_report
@@ -17,7 +16,7 @@ from evaluation.holdout_consistency import evaluate_holdout_consistency
 from evaluation.multiframe_consistency import evaluate_multiframe_consistency
 from quality.quality_score import compute_quality_score
 
-from tests.test_holdout_consistency import _make_dataset, _make_lidar_spec, _make_camera
+from tests.test_holdout_consistency import _make_dataset, _make_lidar_spec
 
 
 def _full_pipeline(x_drifts, **edge_kwargs):

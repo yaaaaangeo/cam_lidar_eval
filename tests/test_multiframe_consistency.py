@@ -85,7 +85,6 @@ def test_multiframe_consistency_empty_dataset():
 
 def test_multiframe_consistency_all_frames_fail_gracefully():
     # blank image -> Canny finds no edges -> every frame's M2 call FAILs
-    import numpy as np
     from tests.test_holdout_consistency import _make_camera, _make_lidar_spec as _lspec
     from input.camera import CameraFrame
     from input.lidar import LidarFrame

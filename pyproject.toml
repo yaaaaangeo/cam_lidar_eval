@@ -28,6 +28,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 
@@ -42,6 +43,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0",  # optional: every test file also runs standalone with `python3 tests/test_X.py`
+    "ruff>=0.6",    # lint (see [tool.ruff] below): `ruff check .`
+]
+rosbag = [
+    "rosbags>=0.10",        # pure-Python rosbag1/rosbag2 reader -- no ROS/rclpy install needed
+    "rosbags-image>=0.10",  # ROS Image/CompressedImage -> OpenCV conversion
 ]
 
 [project.urls]
@@ -66,3 +72,17 @@ packages = [
     "report",
     "visualization",
 ]
+
+# Deliberately scoped to just the pyflakes-equivalent rule set (F: unused
+# imports/names, undefined names, etc.) -- the kind of real, low-noise bug
+# this project has caught by hand a few times already (e.g. stale imports
+# left behind after a refactor). Broader style rule sets (import sorting,
+# `Optional[X]` -> `X | None` modernization, line length, etc.) are
+# intentionally NOT enabled: they'd fire ~175 times against this codebase's
+# existing, consistent conventions and turn CI lint output into noise
+# nobody reads, rather than a small number of things actually worth fixing.
+[tool.ruff]
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F"]
