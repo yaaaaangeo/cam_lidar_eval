@@ -1,7 +1,5 @@
 # Cam–LiDAR Calibration Evaluation Tool
 
-**[English](README.md) | 한국어**
-
 **이미 존재하는** camera–LiDAR extrinsic calibration(`T_CL`)의 품질을
 GT(Ground Truth) 없이 평가하는 툴입니다. 이 툴은 새로운 calibration을
 계산하지 않습니다 — 이미 갖고 있는 calibration을 얼마나 신뢰할 수 있는지,
@@ -31,8 +29,8 @@ GT 없이도 측정 가능한 것들:
 ## 2. 설치
 
 ```bash
-git clone https://github.com/YOUR_ORG/cam-lidar-eval.git
-cd cam-lidar-eval
+git clone https://github.com/yaaaaangeo/cam_lidar_eval.git
+cd cam_lidar_eval
 pip install -e .
 ```
 
@@ -103,10 +101,13 @@ evaluation:
 ```
 
 유용한 플래그: `--fail-on-bad` (overall quality가 BAD/FAIL이면 exit code
-0이 아니게 — CI용), `--advanced` (Phase-5 진단도 함께 실행), `--no-visuals`
-(이미지 생성 생략, 훨씬 빠름), `--weights geometry=0.5,...` (카테고리
-가중치 오버라이드), `--frame-index N` (M2의 대표값을 어느 프레임에서
-가져올지 지정).
+0이 아니게 — CI용), `--fail-on-partial` (M2/M3/M4 중 하나라도 완전히
+FAIL해서 Overall Quality 계산에서 제외됐다면 exit code 0이 아니게 —
+overall quality 자체는 나머지 카테고리만으로 GOOD/WARNING이 나올 수
+있으므로 `--fail-on-bad`와는 별개로 필요; CI용), `--advanced` (Phase-5
+진단도 함께 실행), `--no-visuals` (이미지 생성 생략, 훨씬 빠름),
+`--weights geometry=0.5,...` (카테고리 가중치 오버라이드), `--frame-index
+N` (M2의 대표값을 어느 프레임에서 가져올지 지정).
 
 ---
 
@@ -194,12 +195,12 @@ cam_lidar_eval/
 ├── app/
 │   └── cli.py                   진입점: config/demo → pipeline → report → 콘솔 요약
 │
-├── tests/                      20개 파일에 걸친 249개 테스트 (§7 참고)
+├── tests/                      20개 파일에 걸친 253개 테스트 (§7 참고)
 │
 ├── pyproject.toml               패키지 메타데이터, 의존성, `cam-lidar-eval` 콘솔 스크립트
 ├── requirements.txt             `pip install -e .`의 순수 pip 대안
 ├── run_tests.sh                 전체 테스트 스위트 실행, CI 친화적 exit code
-├── .github/workflows/ci.yml     GitHub Actions: Python 3.10-3.12에서 install + test + CLI smoke test
+├── .github/workflows/ci.yaml     GitHub Actions: Python 3.10-3.12에서 install + test + CLI smoke test
 └── LICENSE                      MIT
 ```
 
@@ -262,6 +263,14 @@ Geometry(M2) / Generalization(M3) / Stability(M4)는 기본적으로 동일한
 제외되고 나머지 가중치가 재정규화됩니다 (조용히 0점 처리하지 않음 —
 "측정 못함"과 "측정했더니 최악"은 다른 것이므로).
 
+단, 카테고리가 하나라도 제외된 채로 계산된 Overall Quality는 남은
+카테고리 점수가 아무리 좋아도 classification이 **WARNING을 넘지
+못하도록 캡**됩니다 (숫자 점수 자체는 캡하지 않음). 예를 들어 M2/M3가
+FAIL하고 M4만 100점이어도 Overall Quality는 "100.0 WARNING"이지
+"100.0 GOOD"이 아닙니다 — 부분적으로만 평가된 결과가 완전히 평가된
+결과와 같은 신뢰도로 보이면 안 되기 때문입니다. CI에서 이런 "부분
+평가" 자체를 실패로 처리하고 싶다면 `--fail-on-partial`을 쓰세요.
+
 ---
 
 ## 6. 리포트 출력
@@ -288,7 +297,7 @@ python3 tests/test_noise_floor.py         # 또는 개별 파일 직접 실행
 ```
 
 `run_tests.sh`는 뭔가 실패하면 exit code가 0이 아니게 되며,
-`.github/workflows/ci.yml`이 매 push/PR마다 (Python 3.10-3.12) 실행하는
+`.github/workflows/ci.yaml`이 매 push/PR마다 (Python 3.10-3.12) 실행하는
 것과 정확히 동일한 스크립트입니다.
 
 pytest 의존성 불필요 — 모든 테스트 파일은 자체 러너
@@ -296,7 +305,7 @@ pytest 의존성 불필요 — 모든 테스트 파일은 자체 러너
 출력하고 실패 시 exit code가 0이 아니게 됩니다. 따라서
 `python3 tests/test_X.py`는 단독으로도, CI에서도 그대로 동작합니다.
 
-**20개 파일에 걸친 249개 테스트**, 전부 통과:
+**20개 파일에 걸친 253개 테스트**, 전부 통과 (전체 실행 약 2~3분):
 
 | 파일 | 테스트 수 | 커버리지 |
 |---|---|---|

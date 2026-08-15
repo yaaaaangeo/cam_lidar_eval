@@ -172,6 +172,42 @@ def test_main_demo_drift_with_fail_on_bad_returns_nonzero():
         assert code == 2
 
 
+def test_main_demo_drift_with_fail_on_partial_returns_nonzero():
+    # Default drift scenario (no --edge-radius-px override): M2 and M3 FAIL
+    # outright (0 edge points), M4 alone is GOOD -> overall is a partial
+    # result. --fail-on-bad alone would NOT catch this (overall caps at
+    # WARNING, not BAD), so --fail-on-partial exists specifically to catch
+    # "couldn't fully evaluate this calibration" in CI.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code_no_flag = main(["--demo", "--scenario", "drift", "--demo-frames", "20",
+                              "--output-dir", tmpdir, "--no-visuals"])
+        assert code_no_flag == 0
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code_bad_only = main(["--demo", "--scenario", "drift", "--demo-frames", "20",
+                               "--output-dir", tmpdir, "--no-visuals", "--fail-on-bad"])
+        assert code_bad_only == 0  # WARNING, not BAD/FAIL -- fail-on-bad doesn't trigger
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code_partial = main(["--demo", "--scenario", "drift", "--demo-frames", "20",
+                              "--output-dir", tmpdir, "--no-visuals", "--fail-on-partial"])
+        assert code_partial == 3
+        import json
+        with open(os.path.join(tmpdir, "report.json")) as f:
+            report = json.load(f)
+        assert report["quality_score"]["num_valid_categories"] < len(report["quality_score"]["categories"])
+
+
+def test_main_demo_good_with_fail_on_partial_returns_zero():
+    # Sanity check: a fully-valid (3/3 categories) result must NOT trigger
+    # --fail-on-partial, even combined with --fail-on-bad.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = main(["--demo", "--scenario", "good", "--demo-frames", "20",
+                     "--output-dir", tmpdir, "--no-visuals",
+                     "--fail-on-bad", "--fail-on-partial"])
+        assert code == 0
+
+
 def test_main_missing_config_returns_one():
     code = main(["--config", "/definitely/does/not/exist.yaml", "--output-dir", "/tmp/x"])
     assert code == 1

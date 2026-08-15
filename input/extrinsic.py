@@ -18,7 +18,7 @@ Two distinct responsibilities kept separate, matching the spec:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Union
+from typing import Literal, Union
 
 import numpy as np
 

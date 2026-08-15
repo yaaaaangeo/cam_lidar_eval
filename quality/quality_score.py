@@ -136,6 +136,14 @@ def compute_quality_score(
 
     If ALL categories FAILed, overall_score is NaN and
     overall_classification is "FAIL".
+
+    If SOME (but not all) categories FAILed, overall_classification is
+    capped at "WARNING" even if the renormalized score of the surviving
+    categories would round-trip to "GOOD" -- a partial result should never
+    look as trustworthy as a complete one. overall_score itself is left
+    un-clamped (it still reflects the renormalized weighted average of the
+    valid categories) so the underlying number remains inspectable; only
+    the classification label is capped.
     """
     weights = dict(weights) if weights else dict(DEFAULT_WEIGHTS)
     expected_keys = {"geometry", "generalization", "stability"}
@@ -198,6 +206,22 @@ def compute_quality_score(
             f"Overall Quality is based on {len(valid_categories)}/{len(categories)} "
             f"categories (weights renormalized to {renormalized})."
         )
+        # A category FAILing outright ("couldn't measure this") is strictly
+        # worse information than a low-but-valid score ("measured, and it's
+        # bad") -- so a partial Overall Quality must never read as better
+        # than WARNING, no matter how good the surviving categories look.
+        # Without this cap, e.g. 2/3 categories FAILing (M2 + M3 both unable
+        # to run) while the remaining category (M4) scores perfectly would
+        # still report "100.0 GOOD", which is misleading for a --fail-on-bad
+        # CI gate: it would pass even though most of the calibration could
+        # not actually be evaluated.
+        if overall_classification == "GOOD":
+            overall_classification = "WARNING"
+            warnings.append(
+                "Overall Quality classification capped at WARNING because not all "
+                "categories could be measured -- a partial result cannot be reported "
+                "as GOOD, even if the categories that were measured scored well."
+            )
 
     return QualityScoreResult(
         categories=categories,

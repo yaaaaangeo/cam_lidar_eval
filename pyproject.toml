@@ -45,8 +45,8 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/YOUR_ORG/cam-lidar-eval"
-Issues = "https://github.com/YOUR_ORG/cam-lidar-eval/issues"
+Homepage = "https://github.com/yaaaaangeo/cam_lidar_eval"
+Issues = "https://github.com/yaaaaangeo/cam_lidar_eval/issues"
 
 [project.scripts]
 cam-lidar-eval = "app.cli:main"

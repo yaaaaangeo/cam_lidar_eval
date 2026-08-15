@@ -1,53 +1,56 @@
-# Contributing
+# 기여 가이드 (Contributing)
 
-## Setup
+## 준비
 
 ```bash
-git clone https://github.com/YOUR_ORG/cam-lidar-eval.git
-cd cam-lidar-eval
+git clone https://github.com/yaaaaangeo/cam_lidar_eval.git
+cd cam_lidar_eval
 pip install -e .
 ```
 
-## Running tests
+## 테스트 실행
 
 ```bash
-./run_tests.sh                       # everything
-python3 tests/test_edge_alignment.py # a single file
+./run_tests.sh                       # 전체 테스트
+python3 tests/test_edge_alignment.py # 파일 하나만
 ```
 
-Every test file works standalone (no pytest required), but `pytest tests/`
-also works if you prefer it.
+모든 테스트 파일은 pytest 없이도 단독으로 동작하지만, 선호한다면
+`pytest tests/`도 그대로 사용할 수 있습니다.
 
-## Code layout
+## 코드 구조
 
-See the README's "Architecture" section (§4) for the directory map. A few
-conventions worth knowing before contributing:
+디렉토리 구조 전체는 README의 "아키텍처" 섹션(§4)을 참고하세요. 기여하기
+전에 알아두면 좋은 몇 가지 컨벤션입니다:
 
-- **Modules are flat top-level packages** (`input`, `geometry`,
-  `evaluation`, `quality`, `visualization`, `report`, `app`), not nested
-  under a single namespace. Keep new modules consistent with this — import
-  as `from evaluation.edge_alignment import ...`, not relative imports.
-- **Metrics return dataclasses, not plain dicts.** Serialization to
-  JSON/HTML happens exclusively in `report/builder.py` — that's the one
-  place that decides what's report-worthy and sanitizes NaN/Inf. Don't
-  hand-serialize a metric result elsewhere.
-- **Every threshold is sensor-relative**, derived from `quality.noise_floor`
-  multipliers — avoid introducing new hardcoded absolute-pixel thresholds.
-- **New metrics should validate against a synthetic scene with a known
-  ground truth**, the same way M2/M3/M4 do (see `tests/test_edge_alignment.py`'s
-  `_make_synthetic_scene`): assert the metric moves in the *correct
-  direction* as you perturb calibration, not just that it runs without
-  crashing.
-- **Advanced (Phase-5) metrics must never affect `quality_score`.** They're
-  opt-in diagnostics (`--advanced`), not part of the MVP scored set.
+- **모듈은 단일 네임스페이스 아래로 중첩되지 않은 flat top-level
+  패키지**(`input`, `geometry`, `evaluation`, `quality`, `visualization`,
+  `report`, `app`)입니다. 새 모듈도 이 구조를 따르세요 — import는
+  `from evaluation.edge_alignment import ...`처럼 쓰고, relative import는
+  쓰지 않습니다.
+- **Metric은 plain dict가 아니라 dataclass를 반환합니다.** JSON/HTML로의
+  직렬화는 오직 `report/builder.py`에서만 일어납니다 — 무엇이 리포트에
+  실릴 가치가 있는지 판단하고 NaN/Inf를 정리하는 유일한 지점입니다. 다른
+  곳에서 metric 결과를 직접 직렬화하지 마세요.
+- **모든 threshold는 센서 상대적**이며 `quality.noise_floor`의 배수에서
+  유도됩니다 — 새로운 하드코딩된 절대 픽셀 threshold를 도입하지 마세요.
+- **새 metric은 known ground truth를 가진 합성 장면으로 검증해야
+  합니다.** M2/M3/M4가 하는 방식과 동일하게(`tests/test_edge_alignment.py`의
+  `_make_synthetic_scene` 참고): 그냥 크래시 없이 도는지만 확인하지 말고,
+  calibration을 흔들었을 때 metric이 *올바른 방향*으로 움직이는지
+  assert하세요.
+- **Advanced(Phase-5) metric은 절대 `quality_score`에 영향을 주면 안
+  됩니다.** 이들은 opt-in 진단용(`--advanced`)이며 MVP 점수 집합에
+  포함되지 않습니다.
 
-## Adding a new metric
+## 새 metric 추가하기
 
-1. Implement it in `evaluation/your_metric.py`, returning a dataclass with
-   at least a `classification` field (`"GOOD" | "WARNING" | "BAD" | "FAIL"`).
-2. Add a synthetic-scene test in `tests/test_your_metric.py`.
-3. If it's MVP-scored, wire it into `quality/quality_score.py`. If it's
-   advanced/supplementary, add a `*_summary()` function in
-   `report/builder.py` and wire it into `report/html.py`'s advanced section
-   instead (see `plane_consistency_summary` for the pattern).
-4. Wire it into `app/cli.py` if it should be runnable from the CLI.
+1. `evaluation/your_metric.py`에 구현하고, 최소한 `classification`
+   필드(`"GOOD" | "WARNING" | "BAD" | "FAIL"`)를 가진 dataclass를
+   반환하세요.
+2. `tests/test_your_metric.py`에 합성 장면 테스트를 추가하세요.
+3. MVP 점수에 포함된다면 `quality/quality_score.py`에 연결하세요. 부가
+   진단용이라면 `report/builder.py`에 `*_summary()` 함수를 추가하고
+   `report/html.py`의 advanced 섹션에 연결하세요 (`plane_consistency_summary`
+   패턴 참고).
+4. CLI에서 실행 가능해야 한다면 `app/cli.py`에도 연결하세요.

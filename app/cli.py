@@ -357,7 +357,10 @@ def print_console_summary(report: dict, output_dir: str) -> None:
         print(row(label, f'{score_str:<14} [{cat["classification"]}]'))
     print(sep)
     overall_str = f'{q["overall_score"]:.1f} / 100' if q["overall_score"] is not None else "N/A"
-    print(row("OVERALL QUALITY", f'{overall_str:<14} [{q["overall_classification"]}]'))
+    num_valid = q["num_valid_categories"]
+    num_total = len(q["categories"])
+    partial_suffix = f" ({num_valid}/{num_total} categories)" if num_valid < num_total else ""
+    print(row("OVERALL QUALITY", f'{overall_str:<14} [{q["overall_classification"]}]{partial_suffix}'))
     print(sep)
 
     advanced = report.get("advanced")
@@ -420,6 +423,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                               "roughly 24 times. Never affects the quality score.")
     parser.add_argument("--fail-on-bad", action="store_true",
                          help="Exit with a non-zero status if overall quality is BAD or FAIL (useful in CI).")
+    parser.add_argument("--fail-on-partial", action="store_true",
+                         help="Exit with a non-zero status if any category (M2/M3/M4) FAILed outright and "
+                              "was excluded from Overall Quality -- even if the surviving categories scored "
+                              "well enough that overall quality itself is GOOD/WARNING. Use this when a "
+                              "calibration must be evaluated on all three axes to be trusted, not just the "
+                              "ones that happened to be measurable (useful in CI).")
     return parser
 
 
@@ -475,8 +484,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     print_console_summary(report, args.output_dir)
 
-    if args.fail_on_bad and report["quality_score"]["overall_classification"] in ("BAD", "FAIL"):
+    q = report["quality_score"]
+    if args.fail_on_bad and q["overall_classification"] in ("BAD", "FAIL"):
         return 2
+    if args.fail_on_partial and q["num_valid_categories"] < len(q["categories"]):
+        return 3
     return 0
 
 

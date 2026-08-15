@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Literal, Optional
 import glob
 import os
-import struct
 
 import numpy as np
 

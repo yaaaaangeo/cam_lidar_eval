@@ -65,25 +65,56 @@ def extract_lidar_edge_points(
     edge-defining).
 
     Returns a boolean mask over the input pixels/depths arrays.
+
+    Performance note: this vectorizes the per-point neighbor reduction using
+    cKDTree.query_pairs(..., output_type="ndarray") to get every within-radius
+    point pair as one array computed entirely in C, then np.maximum.at /
+    np.minimum.at to reduce per-point neighbor depths -- instead of looping
+    over every point in Python (via query_ball_point's ragged per-point
+    lists) and calling .max()/.min() on each point's neighbor-depth array
+    individually. That per-point Python loop -- and even a from-python-list
+    flattening step -- used to dominate this function's runtime (and the
+    test suite's) for tens of thousands of points, because both a numpy
+    reduction call and a Python-level list/generator iteration carry fixed
+    overhead that's large relative to the tiny amount of actual work per
+    point.
     """
     n = pixels.shape[0]
     if n == 0:
         return np.zeros(0, dtype=bool)
 
     tree = cKDTree(pixels)
-    edge_mask = np.zeros(n, dtype=bool)
+    # Each point is trivially its own neighbor (distance 0), matching
+    # query_ball_point's semantics (which always includes the query point
+    # itself). query_pairs only returns the *other* pairs (i < j, i != j),
+    # so self-pairs are added explicitly below.
+    pairs = tree.query_pairs(r=radius_px, output_type="ndarray")
 
-    neighbor_lists = tree.query_ball_point(pixels, r=radius_px)
+    self_ids = np.arange(n, dtype=np.intp)
+    if pairs.shape[0] == 0:
+        point_ids = self_ids
+        neighbor_ids = self_ids
+    else:
+        i, j = pairs[:, 0], pairs[:, 1]
+        # Each unordered pair (i, j) contributes to both i's and j's
+        # neighbor set, plus every point is its own neighbor.
+        point_ids = np.concatenate([i, j, self_ids])
+        neighbor_ids = np.concatenate([j, i, self_ids])
 
-    for i, neighbor_idx in enumerate(neighbor_lists):
-        if len(neighbor_idx) < min_neighbors:
-            continue
-        neighbor_depths = depths[neighbor_idx]
-        depth_range = neighbor_depths.max() - neighbor_depths.min()
-        if depth_range > depth_jump_threshold_m:
-            if depths[i] <= neighbor_depths.min() + 1e-9:
-                edge_mask[i] = True
+    neighbor_counts = np.bincount(point_ids, minlength=n)
+    neighbor_depths = depths[neighbor_ids]
 
+    max_depth = np.full(n, -np.inf, dtype=np.float64)
+    min_depth = np.full(n, np.inf, dtype=np.float64)
+    np.maximum.at(max_depth, point_ids, neighbor_depths)
+    np.minimum.at(min_depth, point_ids, neighbor_depths)
+
+    depth_range = max_depth - min_depth
+    edge_mask = (
+        (neighbor_counts >= min_neighbors)
+        & (depth_range > depth_jump_threshold_m)
+        & (depths <= min_depth + 1e-9)
+    )
     return edge_mask
 
 

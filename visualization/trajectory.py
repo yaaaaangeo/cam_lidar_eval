@@ -19,7 +19,7 @@ matplotlib.use("Agg")  # headless: no display server needed, safe for CLI/report
 import matplotlib.pyplot as plt
 import numpy as np
 
-from quality.noise_floor import STD_GOOD_MULTIPLIER, STD_WARNING_MULTIPLIER, M2_GOOD_MULTIPLIER, M2_WARNING_MULTIPLIER
+from quality.noise_floor import M2_GOOD_MULTIPLIER, M2_WARNING_MULTIPLIER
 
 
 _GOOD = "#3FB950"

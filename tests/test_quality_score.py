@@ -151,6 +151,39 @@ def test_quality_score_excludes_failed_category_and_renormalizes():
     assert any("excluded from the Overall Quality" in w for w in result.warnings)
 
 
+def test_quality_score_partial_result_capped_at_warning_even_if_score_is_high():
+    # M2 and M3 are both uniformly good (would score GOOD on their own),
+    # but M4 FAILs outright (too few frames). Regression test for the bug
+    # where a partial Overall Quality (here 1/3 categories, since M2 is
+    # used as the drift scenario's single successful category in the CLI
+    # report) could still be labeled "GOOD" -- which is misleading for a
+    # --fail-on-bad CI gate, since it implies the calibration is fully
+    # evaluated and trustworthy when most of it couldn't be measured.
+    m2, m3, _ = _run_all_metrics([0.0] * 40, depth_jump_threshold_m=1.0)
+    dataset = _make_dataset([0.0] * 10)
+    m4_fail = evaluate_multiframe_consistency(dataset, lidar_spec=_make_lidar_spec(), min_frames=30)
+    assert m4_fail.classification == "FAIL"
+
+    result = compute_quality_score(m2, m3, m4_fail)
+    assert result.num_valid_categories == 2
+    # The underlying renormalized score is still high (M2 + M3 both GOOD)...
+    assert result.overall_score > 80
+    # ...but the classification must NOT read as GOOD, since a category
+    # FAILing outright is worse information than a low-but-valid score.
+    assert result.overall_classification == "WARNING"
+    assert any("capped at WARNING" in w for w in result.warnings)
+
+
+def test_quality_score_full_result_not_capped_when_all_categories_valid():
+    # Sanity check the cap only applies to partial results: an all-valid,
+    # all-GOOD result must still report GOOD, not be capped by accident.
+    m2, m3, m4 = _run_all_metrics([0.0] * 40, depth_jump_threshold_m=1.0)
+    result = compute_quality_score(m2, m3, m4)
+    assert result.num_valid_categories == 3
+    assert result.overall_classification == "GOOD"
+    assert not any("capped at WARNING" in w for w in result.warnings)
+
+
 def test_quality_score_all_categories_failed_gives_nan_overall():
     blank_camera = _make_camera()
     blank_image = np.zeros((blank_camera.height, blank_camera.width, 3), dtype=np.uint8)
