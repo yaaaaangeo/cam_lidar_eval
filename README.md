@@ -169,15 +169,15 @@ N` (M2의 대표값을 어느 프레임에서 가져올지 지정), `--version` 
                     │
                     ▼
       ┌──────────────────────────┐
-      │ M0 Sanity Gate (게이트,  │   evaluation/sanity_gate.py
-      │ 점수 아님)                │
+      │ M0 Sanity Gate           │   evaluation/sanity_gate.py
+      │ (게이트, 점수 아님)       │
       └──────────────┬───────────┘
                       ▼
    ┌─────────────────────────────────────┐
-   │            Evaluation Engine          │
-   │  M2 Geometry │ M3 Generalization │   │  evaluation/edge_alignment.py
-   │              │ M4 Stability      │   │  evaluation/holdout_consistency.py
-   └───────┬──────┴──────────┬────────┘   │  evaluation/multiframe_consistency.py
+   │         Evaluation Engine           │
+   │  M2 Geometry │ M3 Generalization    │   evaluation/edge_alignment.py
+   │              │ M4 Stability         │   evaluation/holdout_consistency.py
+   └───────┬──────┴──────────┬───────────┘   evaluation/multiframe_consistency.py
            ▼                 ▼
    quality/noise_floor.py → floor(Z), 센서 상대적 threshold
    quality/normalization.py → 0-100 점수 곡선, floor(Z) 배수에 고정
