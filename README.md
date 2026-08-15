@@ -5,8 +5,8 @@ GT(Ground Truth) 없이 평가하는 툴입니다. 이 툴은 새로운 calibrat
 계산하지 않습니다 — 이미 갖고 있는 calibration을 얼마나 신뢰할 수 있는지,
 GT 없이 알려줍니다.
 
-> 전체 설계 근거는 `evaluation_metric_spec.md`에 있습니다. 이 README는
-> "어떻게 실행하는지 / 어떻게 만들어졌는지"를 다루는 실전 가이드입니다.
+> 전체 설계 근거는 [`evaluation_metric_spec.md`](evaluation_metric_spec.md)에 있습니다. 
+> 이 README는 "어떻게 실행하는지 / 어떻게 만들어졌는지"를 다루는 실전 가이드입니다.
 
 ---
 
@@ -125,8 +125,8 @@ N` (M2의 대표값을 어느 프레임에서 가져올지 지정).
                     │
                     ▼
       ┌──────────────────────────┐
-      │ M0 Sanity Gate (게이트,  │   evaluation/sanity_gate.py
-      │ 점수 아님)                │
+      │ M0 Sanity Gate           │   evaluation/sanity_gate.py
+      │ (게이트, 점수 아님)       │
       └──────────────┬───────────┘
                       ▼
    ┌─────────────────────────────────────┐
