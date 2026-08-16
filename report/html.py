@@ -11,10 +11,15 @@ readout, not a marketing page. Dark console background, semantic
 GOOD/WARNING/BAD/FAIL color coding used consistently everywhere (badges,
 the overall-score gauge ring, category tiles), and monospace type for every
 numeric readout to reinforce that these are precise sensor measurements.
-No JavaScript is required -- the overall-score ring is pure CSS
-(conic-gradient), so the file works as a plain double-clickable static
-document with no server and no network dependency beyond optional web fonts
-(which degrade gracefully to system fonts if unavailable).
+No JavaScript is required for the core report -- the overall-score ring
+is pure CSS (conic-gradient), so the file works as a plain
+double-clickable static document with no server and no network dependency
+beyond optional web fonts (which degrade gracefully to system fonts if
+unavailable). The one opt-in exception is the interactive 3D viewer: when
+an interactive scene is supplied, this module inlines the vendored
+plotly.js gl3d bundle (report/vendor/, no CDN) plus the scene's JSON data
+directly into the document, so the file still works fully offline -- just
+no longer JS-free in that case.
 """
 
 from __future__ import annotations
@@ -22,7 +27,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 from html import escape
+from functools import lru_cache
 import base64
+import json
+import os
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +343,36 @@ footer {
   font-family: var(--font-mono);
   margin-top: 2.5rem;
 }
+
+.view-toggle {
+  display: inline-flex;
+  gap: 0.25rem;
+  background: var(--surface-alt);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.2rem;
+  margin-top: 0.6rem;
+}
+.view-toggle-btn {
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 0.35rem 0.8rem;
+  cursor: pointer;
+}
+.view-toggle-btn.active {
+  background: var(--surface);
+  color: var(--text-primary);
+}
+.view-panel {
+  display: none;
+}
+.view-panel.active {
+  display: block;
+}
 """
 
 _FONT_LINKS = (
@@ -442,7 +480,14 @@ def _render_categories(quality: dict) -> str:
     return f'<div class="category-grid">{"".join(cards)}</div>'
 
 
-def _render_m2(m2: dict, overlay_png: Optional[bytes] = None, histogram_png: Optional[bytes] = None) -> str:
+def _render_m2(
+    m2: dict,
+    overlay_png: Optional[bytes] = None,
+    histogram_png: Optional[bytes] = None,
+    colorized_pointcloud_png: Optional[bytes] = None,
+    error_heatmap_png: Optional[bytes] = None,
+    bev_dual_panel_png: Optional[bytes] = None,
+) -> str:
     return f"""
     <section class="metric-section">
       <h3>M2 &middot; Edge Alignment {_badge(m2["classification"])}</h3>
@@ -458,6 +503,12 @@ def _render_m2(m2: dict, overlay_png: Optional[bytes] = None, histogram_png: Opt
       {_img_tag(overlay_png, "Projected LiDAR edge points over the camera image, colored GOOD/WARNING/BAD")}
       {_img_tag(histogram_png, "Histogram of per-point alignment error")}
       {_render_warning_list(m2["warnings"])}
+      <p class="metric-subtitle" style="margin-top:1.25rem;">Spatial error heatmap: image split into a grid, with each cell's average error shown as a translucent GOOD/WARNING/BAD color. Errors concentrated at edges/corners or one side of the frame point at a specific cause (e.g. distortion, a small rotation offset) rather than uniform miscalibration.</p>
+      {_img_tag(error_heatmap_png, "Grid heatmap of spatially-aggregated alignment error, colored GOOD/WARNING/BAD")}
+      <p class="metric-subtitle" style="margin-top:1.25rem;">Bird's-eye view: the same edge points shown in both the camera image and a top-down view (X vs depth), colored identically in each. Makes it easy to see whether error grows with distance or concentrates on one side.</p>
+      {_img_tag(bev_dual_panel_png, "Camera image and bird's-eye view side by side, with the same edge points highlighted and colored to match in both")}
+      <p class="metric-subtitle" style="margin-top:1.25rem;">Fused view: LiDAR points colorized by the camera pixel they project onto. Color bleed or smearing at object edges is a visual sign of extrinsic misalignment.</p>
+      {_img_tag(colorized_pointcloud_png, "LiDAR point cloud colorized by projected camera pixel, shown from a 3D angle and bird's-eye view")}
     </section>
     """
 
@@ -551,6 +602,103 @@ def _render_warning_list(warnings: list[str]) -> str:
     return f'<div style="margin-top:1rem;">{items}</div>'
 
 
+_VENDOR_DIR = os.path.join(os.path.dirname(__file__), "vendor")
+
+
+@lru_cache(maxsize=1)
+def _load_plotly_js() -> str:
+    """Read the vendored plotly.js gl3d bundle off disk (see
+    report/vendor/README.md). Cached so repeated report generation in a
+    single process only pays the ~1.7MB read once."""
+    path = os.path.join(_VENDOR_DIR, "plotly-gl3d.min.js")
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _render_rig_geometry(
+    metadata: dict,
+    frustum_png: Optional[bytes] = None,
+    interactive_scene: Optional[dict] = None,
+    div_id: str = "cam-lidar-interactive-3d",
+) -> str:
+    """
+    Render the top-of-report "Rig Geometry" section. If both a static
+    frustum PNG and interactive scene data are available, shows a
+    Static/Interactive toggle (defaulting to Static, since it costs
+    nothing to display) with the interactive Plotly scene lazily
+    initialized on first switch -- not on page load -- so opening the
+    report doesn't pay Plotly's render cost unless someone actually asks
+    for it. Falls back to whichever single view is available, or "" if
+    neither is.
+    """
+    if not frustum_png and not interactive_scene:
+        return ""
+
+    ext = metadata["extrinsic"]
+    stat_grid = f"""
+      <div class="stat-grid">
+        {_stat("Baseline", _fmt(ext["baseline_m"], " m"))}
+        {_stat("Parent &rarr; child", f'{escape(ext["parent"])} &rarr; {escape(ext["child"])}')}
+      </div>
+    """
+
+    if frustum_png and interactive_scene:
+        scene_json = json.dumps(interactive_scene, separators=(",", ":"))
+        body = f"""
+      <div class="view-toggle">
+        <button type="button" class="view-toggle-btn active" data-target="rig-static-view">Static</button>
+        <button type="button" class="view-toggle-btn" data-target="rig-interactive-view">Interactive</button>
+      </div>
+      <div id="rig-static-view" class="view-panel active">
+        {_img_tag(frustum_png, "3D view of the camera's position and viewing frustum in the LiDAR coordinate frame")}
+      </div>
+      <div id="rig-interactive-view" class="view-panel">
+        <div id="{div_id}" style="width:100%; height:520px; margin-top:0.75rem; border-radius:10px; overflow:hidden;"></div>
+      </div>
+      <script>
+        (function() {{
+          var scene = {scene_json};
+          var rendered = false;
+          var panels = document.querySelectorAll('#rig-geometry-section .view-panel');
+          var buttons = document.querySelectorAll('#rig-geometry-section .view-toggle-btn');
+          buttons.forEach(function(btn) {{
+            btn.addEventListener('click', function() {{
+              var target = btn.getAttribute('data-target');
+              panels.forEach(function(p) {{ p.classList.toggle('active', p.id === target); }});
+              buttons.forEach(function(b) {{ b.classList.toggle('active', b === btn); }});
+              if (target === 'rig-interactive-view' && !rendered) {{
+                Plotly.newPlot({div_id!r}, scene.data, scene.layout, scene.config);
+                rendered = true;
+              }}
+            }});
+          }});
+        }})();
+      </script>
+    """
+    elif interactive_scene:
+        scene_json = json.dumps(interactive_scene, separators=(",", ":"))
+        body = f"""
+      <div id="{div_id}" style="width:100%; height:520px; margin-top:0.75rem; border-radius:10px; overflow:hidden;"></div>
+      <script>
+        (function() {{
+          var scene = {scene_json};
+          Plotly.newPlot({div_id!r}, scene.data, scene.layout, scene.config);
+        }})();
+      </script>
+    """
+    else:
+        body = _img_tag(frustum_png, "3D view of the camera's position and viewing frustum in the LiDAR coordinate frame")
+
+    return f"""
+    <section class="metric-section" id="rig-geometry-section">
+      <h3>Rig Geometry</h3>
+      <p class="metric-subtitle">Camera position and viewing frustum placed in the LiDAR frame, from the extrinsic under evaluation &mdash; a physical sanity check that's easier to read at a glance than raw translation/rotation numbers. The interactive view also overlays the colorized point cloud; drag to orbit, scroll to zoom.</p>
+      {stat_grid}
+      {body}
+    </section>
+    """
+
+
 def _render_metadata(metadata: dict) -> str:
     cam = metadata["camera"]
     T = metadata["extrinsic"]["T_CL"]
@@ -640,9 +788,16 @@ def render_html_report(report: dict, visuals: Optional[dict] = None) -> str:
 
     visuals: optional dict of PNG bytes to embed as base64 data URIs (so
     the HTML stays a single shareable file). Recognized keys:
-      "overlay_png"     -- from visualization.overlay.render_overlay(...)
-      "histogram_png"   -- from visualization.histogram.render_error_histogram_png(...)
-      "trajectory_png"  -- from visualization.trajectory.render_m4_trajectory_png(...)
+      "overlay_png"              -- from visualization.overlay.render_overlay(...)
+      "histogram_png"            -- from visualization.histogram.render_error_histogram_png(...)
+      "trajectory_png"           -- from visualization.trajectory.render_m4_trajectory_png(...)
+      "colorized_pointcloud_png" -- from visualization.colorized_pointcloud.render_colorized_pointcloud_from_frame(...)
+      "error_heatmap_png"        -- from visualization.error_heatmap.render_error_heatmap_from_result(...)
+      "camera_frustum_png"       -- from visualization.camera_frustum.render_camera_frustum_from_dataset(...)
+      "bev_dual_panel_png"       -- from visualization.bev_dual_panel.render_bev_dual_panel_from_result(...)
+      "interactive_scene"        -- a dict from visualization.interactive_viewer.build_interactive_scene(...)
+                                     (NOT bytes -- raw JSON-serializable scene data, embedded + rendered
+                                     client-side via the vendored plotly.js gl3d bundle)
     Any missing/None key simply omits that image -- visualization is
     optional and the report renders fine without it (see report/json.py's
     counterpart: the JSON report never carries images, only this HTML one).
@@ -654,13 +809,18 @@ def render_html_report(report: dict, visuals: Optional[dict] = None) -> str:
     body = (
         _render_hero(quality)
         + _render_categories(quality)
-        + _render_m2(report["m2_edge_alignment"], visuals.get("overlay_png"), visuals.get("histogram_png"))
+        + _render_rig_geometry(metadata, visuals.get("camera_frustum_png"), visuals.get("interactive_scene"))
+        + _render_m2(report["m2_edge_alignment"], visuals.get("overlay_png"), visuals.get("histogram_png"),
+                     visuals.get("colorized_pointcloud_png"), visuals.get("error_heatmap_png"),
+                     visuals.get("bev_dual_panel_png"))
         + _render_m3(report["m3_holdout_consistency"])
         + _render_m4(report["m4_multiframe_consistency"], visuals.get("trajectory_png"))
         + _render_advanced(report.get("advanced"))
         + _render_metadata(metadata)
         + _render_warning_list(report.get("warnings", []))
     )
+
+    plotly_script_tag = f"<script>{_load_plotly_js()}</script>" if visuals.get("interactive_scene") else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -670,6 +830,7 @@ def render_html_report(report: dict, visuals: Optional[dict] = None) -> str:
 <title>Cam-LiDAR Calibration Quality Report</title>
 {_FONT_LINKS}
 <style>{_CSS}</style>
+{plotly_script_tag}
 </head>
 <body>
   <div class="container">

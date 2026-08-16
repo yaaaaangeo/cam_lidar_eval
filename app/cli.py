@@ -108,6 +108,11 @@ from quality.quality_score import compute_quality_score
 from visualization.overlay import render_overlay_from_result, encode_png
 from visualization.trajectory import render_m4_trajectory_png
 from visualization.histogram import render_error_histogram_png
+from visualization.colorized_pointcloud import render_colorized_pointcloud_from_frame
+from visualization.error_heatmap import render_error_heatmap_from_result
+from visualization.camera_frustum import render_camera_frustum_from_dataset
+from visualization.bev_dual_panel import render_bev_dual_panel_from_result
+from visualization.interactive_viewer import build_interactive_scene_from_dataset
 
 from report.builder import build_report
 from report.json import write_json_report
@@ -501,6 +506,20 @@ def run_pipeline(
         traj_png = render_m4_trajectory_png(m4)
         if traj_png is not None:
             visuals["trajectory_png"] = traj_png
+        colorized_png = render_colorized_pointcloud_from_frame(
+            image, points, dataset.extrinsic.T_CL, dataset.camera,
+        )
+        if colorized_png is not None:
+            visuals["colorized_pointcloud_png"] = colorized_png
+        heatmap_img = render_error_heatmap_from_result(image, m2)
+        if heatmap_img is not None:
+            visuals["error_heatmap_png"] = encode_png(heatmap_img)
+        visuals["camera_frustum_png"] = render_camera_frustum_from_dataset(dataset, frame_index=headline_idx)
+        bev_png = render_bev_dual_panel_from_result(image, points, dataset.extrinsic.T_CL, dataset.camera, m2,
+                                                      edge_kwargs=edge_kwargs)
+        if bev_png is not None:
+            visuals["bev_dual_panel_png"] = bev_png
+        visuals["interactive_scene"] = build_interactive_scene_from_dataset(dataset, frame_index=headline_idx)
 
     report = build_report(
         dataset, m2, m3, m4, quality, m0_result=m0.to_dict(),

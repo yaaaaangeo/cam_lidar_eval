@@ -73,6 +73,14 @@ packages = [
     "visualization",
 ]
 
+# The vendored plotly.js gl3d bundle (report/vendor/) is a non-.py asset
+# that report/html.py reads off disk at report-generation time to embed
+# the interactive 3D viewer -- without this, `pip install`-ed copies of
+# the package would be missing it (setuptools only includes .py files by
+# default). See report/vendor/README.md for what it is and why it's here.
+[tool.setuptools.package-data]
+report = ["vendor/*.js", "vendor/*.LICENSE", "vendor/README.md"]
+
 # Deliberately scoped to just the pyflakes-equivalent rule set (F: unused
 # imports/names, undefined names, etc.) -- the kind of real, low-noise bug
 # this project has caught by hand a few times already (e.g. stale imports
