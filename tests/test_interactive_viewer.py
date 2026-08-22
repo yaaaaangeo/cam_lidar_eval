@@ -96,3 +96,37 @@ def test_build_interactive_scene_from_dataset_raises_on_empty_dataset():
         assert False, "expected ValueError for empty dataset"
     except ValueError:
         pass
+
+
+def test_build_interactive_scene_raises_clear_error_on_dimension_mismatch():
+    # build_interactive_scene delegates to colorize_lidar_points internally,
+    # so it should inherit the same clear ValueError on an image/camera
+    # width-height mismatch, rather than a bare IndexError.
+    camera = _make_camera()
+    points = _make_base_points_cam_frame()
+    wrong_size_image = np.zeros((100, 100, 3), dtype=np.uint8)
+    try:
+        build_interactive_scene(wrong_size_image, points, np.eye(4), camera)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert str(camera.width) in str(e) and str(camera.height) in str(e)
+    except IndexError:
+        assert False, "should raise a clear ValueError, not a bare IndexError"
+
+
+if __name__ == "__main__":
+    test_fns = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
+    passed, failed = 0, 0
+    for fn in test_fns:
+        try:
+            fn()
+            print(f"PASS  {fn.__name__}")
+            passed += 1
+        except AssertionError as e:
+            print(f"FAIL  {fn.__name__}: {e}")
+            failed += 1
+        except Exception as e:
+            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
+            failed += 1
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)

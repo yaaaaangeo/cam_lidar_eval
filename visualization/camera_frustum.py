@@ -29,9 +29,34 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # headless: no display server needed, safe for CLI/report generation
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from geometry.transform import transform_points, invert_transform
+
+
+# mpl_toolkits.mplot3d (needed for Poly3DCollection, and to register
+# matplotlib's "3d" Axes projection at all) can fail to import even when
+# matplotlib itself imports fine -- most commonly when a system-installed
+# matplotlib (e.g. Debian/Ubuntu's apt python3-matplotlib) and a separately
+# pip-installed matplotlib both exist on the same machine, and Python picks
+# up mismatched versions of matplotlib's top-level package vs its
+# mpl_toolkits subpackage (a well-known matplotlib/Debian packaging
+# conflict -- matplotlib itself warns about exactly this: "Unable to
+# import Axes3D. This may be due to multiple versions of Matplotlib being
+# installed"). That's an environment problem, not something this tool can
+# fix on someone's machine -- but it shouldn't take down the ENTIRE CLI at
+# import time just because one optional 3D visualization can't render.
+# So: import defensively here, and every function below that needs 3D
+# plotting checks _MPL3D_AVAILABLE and returns None (this module's
+# established "nothing to show" contract, same as
+# visualization.colorized_pointcloud's Optional[bytes] return) instead of
+# letting an ImportError propagate up through app.cli's module-level
+# import and crash even --demo / --version / --help.
+try:
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    _MPL3D_AVAILABLE = True
+except ImportError:
+    Poly3DCollection = None
+    _MPL3D_AVAILABLE = False
 
 
 _BG = "#0D1117"
@@ -112,12 +137,17 @@ def compute_frustum_geometry(
     )
 
 
-def _auto_depth(points_lidar: Optional[np.ndarray], T_CL: np.ndarray, fallback: float = _DEFAULT_DEPTH_M) -> float:
+def auto_frustum_depth(points_lidar: Optional[np.ndarray], T_CL: np.ndarray, fallback: float = _DEFAULT_DEPTH_M) -> float:
     """Pick a frustum depth that roughly matches the scene scale: the
     75th percentile of in-front-of-camera point depths, if points are
     given, else a fixed fallback. Keeps the drawn frustum sized to the
     actual scene instead of always the same fixed length regardless of
-    environment."""
+    environment.
+
+    Public (not module-private) because visualization.interactive_viewer
+    shares this exact scene-scaling logic for its own frustum trace --
+    both need the same depth so the static PNG and the interactive scene
+    agree on frustum size."""
     if points_lidar is None or len(points_lidar) == 0:
         return fallback
     points_cam = transform_points(T_CL, np.asarray(points_lidar, dtype=float)[:, :3])
@@ -173,7 +203,7 @@ def render_camera_frustum_png(
     elev: float = 22.0,
     azim: float = -60.0,
     seed: int = 0,
-) -> bytes:
+) -> Optional[bytes]:
     """
     Render the rig-geometry summary: LiDAR origin (with axis triad),
     camera position + orientation (axis triad) + viewing frustum, and
@@ -181,61 +211,82 @@ def render_camera_frustum_png(
     LiDAR frame.
 
     depth_m: how far out to draw the frustum. If None, auto-picked from
-    points_lidar's depth distribution (see _auto_depth) so the frustum
+    points_lidar's depth distribution (see auto_frustum_depth) so the frustum
     scales with the actual scene rather than a fixed size regardless of
     rig/environment.
+
+    Returns None (rather than raising) if 3D plotting isn't usable in this
+    environment -- see the module-level _MPL3D_AVAILABLE comment. Also
+    catches any OTHER exception during rendering and returns None instead
+    of propagating, since a broken/partial matplotlib 3D install can fail
+    at points other than the top-level import (e.g. inside
+    `projection="3d"` registration itself) -- this is one optional
+    diagnostic image, not something that should take down an entire
+    report generation run.
     """
+    if not _MPL3D_AVAILABLE:
+        return None
+
     if depth_m is None:
-        depth_m = _auto_depth(points_lidar, T_CL)
+        depth_m = auto_frustum_depth(points_lidar, T_CL)
 
     geom = compute_frustum_geometry(T_CL, K, image_width, image_height, depth_m)
 
     fig = plt.figure(figsize=(7.5, 6.5), dpi=dpi)
-    fig.patch.set_facecolor(_BG)
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_facecolor(_SURFACE)
+    try:
+        fig.patch.set_facecolor(_BG)
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_facecolor(_SURFACE)
 
-    if points_lidar is not None and len(points_lidar) > 0:
-        pts = np.asarray(points_lidar, dtype=float)[:, :3]
-        if pts.shape[0] > max_points:
-            rng = np.random.default_rng(seed)
-            keep = rng.choice(pts.shape[0], size=max_points, replace=False)
-            pts = pts[keep]
-        ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=_POINTS_COLOR, s=0.6, alpha=0.35,
-                   marker=".", linewidths=0, label="LiDAR points", depthshade=False)
+        if points_lidar is not None and len(points_lidar) > 0:
+            pts = np.asarray(points_lidar, dtype=float)[:, :3]
+            if pts.shape[0] > max_points:
+                rng = np.random.default_rng(seed)
+                keep = rng.choice(pts.shape[0], size=max_points, replace=False)
+                pts = pts[keep]
+            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=_POINTS_COLOR, s=0.6, alpha=0.35,
+                       marker=".", linewidths=0, label="LiDAR points", depthshade=False)
 
-    axis_len = max(geom.depth_m * 0.15, 0.15)
-    _draw_axis_triad(ax, origin=np.zeros(3), axes=np.eye(3), length=axis_len)
-    ax.scatter([0], [0], [0], c=_LIDAR_COLOR, s=70, marker="o", label="LiDAR origin", depthshade=False)
+        axis_len = max(geom.depth_m * 0.15, 0.15)
+        _draw_axis_triad(ax, origin=np.zeros(3), axes=np.eye(3), length=axis_len)
+        ax.scatter([0], [0], [0], c=_LIDAR_COLOR, s=70, marker="o", label="LiDAR origin", depthshade=False)
 
-    ax.scatter([geom.camera_origin[0]], [geom.camera_origin[1]], [geom.camera_origin[2]],
-               c=_CAMERA_COLOR, s=70, marker="^", label="Camera origin", depthshade=False)
-    _draw_axis_triad(ax, origin=geom.camera_origin, axes=geom.camera_axes, length=axis_len)
-    _draw_frustum(ax, geom)
+        ax.scatter([geom.camera_origin[0]], [geom.camera_origin[1]], [geom.camera_origin[2]],
+                   c=_CAMERA_COLOR, s=70, marker="^", label="Camera origin", depthshade=False)
+        _draw_axis_triad(ax, origin=geom.camera_origin, axes=geom.camera_axes, length=axis_len)
+        _draw_frustum(ax, geom)
 
-    _set_equal_bounds(ax, np.vstack([geom.camera_origin.reshape(1, 3), geom.far_corners, np.zeros((1, 3))]))
+        _set_equal_bounds(ax, np.vstack([geom.camera_origin.reshape(1, 3), geom.far_corners, np.zeros((1, 3))]))
 
-    ax.set_xlabel("X (m)", color=_TEXT, fontsize=8, labelpad=4)
-    ax.set_ylabel("Y (m)", color=_TEXT, fontsize=8, labelpad=4)
-    ax.set_zlabel("Z (m)", color=_TEXT, fontsize=8, labelpad=4)
-    ax.set_title(
-        f"Camera-LiDAR rig geometry  (HFOV {geom.hfov_deg:.0f}\u00b0, baseline {geom.baseline_m:.2f} m)",
-        color=_TEXT, fontsize=10,
-    )
-    ax.view_init(elev=elev, azim=azim)
-    ax.tick_params(colors=_TEXT, labelsize=6)
-    for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
-        axis.pane.set_facecolor(_SURFACE)
-        axis.pane.set_edgecolor(_GRID)
-        axis.line.set_color(_GRID)
-    ax.grid(color=_GRID)
-    ax.legend(loc="upper left", fontsize=7, facecolor=_SURFACE, edgecolor=_GRID, labelcolor=_TEXT)
+        ax.set_xlabel("X (m)", color=_TEXT, fontsize=8, labelpad=4)
+        ax.set_ylabel("Y (m)", color=_TEXT, fontsize=8, labelpad=4)
+        ax.set_zlabel("Z (m)", color=_TEXT, fontsize=8, labelpad=4)
+        ax.set_title(
+            f"Camera-LiDAR rig geometry  (HFOV {geom.hfov_deg:.0f}\u00b0, baseline {geom.baseline_m:.2f} m)",
+            color=_TEXT, fontsize=10,
+        )
+        ax.view_init(elev=elev, azim=azim)
+        ax.tick_params(colors=_TEXT, labelsize=6)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis.pane.set_facecolor(_SURFACE)
+            axis.pane.set_edgecolor(_GRID)
+            axis.line.set_color(_GRID)
+        ax.grid(color=_GRID)
+        ax.legend(loc="upper left", fontsize=7, facecolor=_SURFACE, edgecolor=_GRID, labelcolor=_TEXT)
 
-    fig.tight_layout()
-    buf = BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return buf.getvalue()
+        fig.tight_layout()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        return buf.getvalue()
+    except Exception:
+        # Broken/partial 3D matplotlib install (see module docstring) can
+        # fail at points other than the top-level import -- degrade to
+        # "no image" rather than crashing whatever called this.
+        return None
+    finally:
+        # Always close, even if a plotting call above raises -- otherwise
+        # the figure leaks in matplotlib's global pyplot state.
+        plt.close(fig)
 
 
 def render_camera_frustum_from_dataset(
@@ -243,7 +294,7 @@ def render_camera_frustum_from_dataset(
     frame_index: Optional[int] = None,
     depth_m: Optional[float] = None,
     **render_kwargs,
-) -> bytes:
+) -> Optional[bytes]:
     """
     Convenience wrapper mirroring the other visualization modules'
     *_from_result/*_from_frame helpers: takes an EvaluationDataset
@@ -251,6 +302,11 @@ def render_camera_frustum_from_dataset(
     one representative frame's points as context. frame_index defaults
     to the temporally-middle frame, matching app.cli's headline-frame
     convention.
+
+    Returns None if 3D plotting isn't available in this environment or
+    rendering otherwise fails -- see render_camera_frustum_png's
+    docstring. Still raises ValueError for an empty dataset, since that's
+    a caller bug (nothing to render at all), not an environment issue.
     """
     if not dataset.frames:
         raise ValueError("Dataset has no synced frames; nothing to render.")

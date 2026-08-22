@@ -77,7 +77,23 @@ def colorize_lidar_points(
     the render responsive and the embedded PNG a reasonable size on dense
     clouds. Does not affect which points count as "valid" in the first
     place, only how many of the valid ones get drawn.
+
+    Raises ValueError if `image`'s actual pixel dimensions don't match
+    image_width/image_height. Sampling a pixel color below indexes into
+    `image` using coordinates bounds-checked against image_width/
+    image_height, not against image.shape -- so a mismatch (e.g. a config
+    width/height that doesn't match the actual image file) would
+    otherwise surface as an IndexError from deep inside the fancy-index
+    call below, which doesn't say what's actually wrong.
     """
+    if image.ndim < 2 or image.shape[0] != image_height or image.shape[1] != image_width:
+        actual = "x".join(str(d) for d in image.shape[:2][::-1]) if image.ndim >= 2 else str(image.shape)
+        raise ValueError(
+            f"image_width/image_height ({image_width}x{image_height}) don't match "
+            f"the actual image shape ({actual}). Check the camera config's "
+            f"width/height against the actual image file."
+        )
+
     points_lidar = np.asarray(points_lidar, dtype=np.float64)
     proj = project_lidar_to_image(
         points_lidar, T_CL, K, dist_coeffs, image_width, image_height,
@@ -147,47 +163,59 @@ def render_colorized_pointcloud_png(
     colors = result.colors_rgb.astype(np.float64) / 255.0
 
     fig = plt.figure(figsize=(10.5, 5), dpi=dpi)
-    fig.patch.set_facecolor(_BG)
+    try:
+        fig.patch.set_facecolor(_BG)
 
-    # --- Panel 1: 3D scatter in the camera frame -----------------------
-    # Camera-frame convention: +X right, +Y down, +Z forward (depth).
-    # Plotted as (X, Z, -Y) so "forward" reads as depth-into-the-page and
-    # "up" reads as up, instead of the raw down-positive Y axis.
-    ax3d = fig.add_subplot(1, 2, 1, projection="3d")
-    ax3d.set_facecolor(_SURFACE)
-    ax3d.scatter(pts[:, 0], pts[:, 2], -pts[:, 1], c=colors, s=point_size, marker=".", linewidths=0)
-    ax3d.set_xlabel("X (m)", color=_TEXT, fontsize=8, labelpad=2)
-    ax3d.set_ylabel("Depth Z (m)", color=_TEXT, fontsize=8, labelpad=2)
-    ax3d.set_zlabel("Up (m)", color=_TEXT, fontsize=8, labelpad=2)
-    ax3d.set_title("Colorized point cloud (camera frame)", color=_TEXT, fontsize=10)
-    ax3d.view_init(elev=elev, azim=azim)
-    ax3d.tick_params(colors=_TEXT, labelsize=6)
-    for axis in (ax3d.xaxis, ax3d.yaxis, ax3d.zaxis):
-        axis.pane.set_facecolor(_SURFACE)
-        axis.pane.set_edgecolor(_GRID)
-        axis.line.set_color(_GRID)
-    ax3d.grid(color=_GRID)
+        # --- Panel 1: 3D scatter in the camera frame -----------------------
+        # Camera-frame convention: +X right, +Y down, +Z forward (depth).
+        # Plotted as (X, Z, -Y) so "forward" reads as depth-into-the-page and
+        # "up" reads as up, instead of the raw down-positive Y axis.
+        ax3d = fig.add_subplot(1, 2, 1, projection="3d")
+        ax3d.set_facecolor(_SURFACE)
+        ax3d.scatter(pts[:, 0], pts[:, 2], -pts[:, 1], c=colors, s=point_size, marker=".", linewidths=0)
+        ax3d.set_xlabel("X (m)", color=_TEXT, fontsize=8, labelpad=2)
+        ax3d.set_ylabel("Depth Z (m)", color=_TEXT, fontsize=8, labelpad=2)
+        ax3d.set_zlabel("Up (m)", color=_TEXT, fontsize=8, labelpad=2)
+        ax3d.set_title("Colorized point cloud (camera frame)", color=_TEXT, fontsize=10)
+        ax3d.view_init(elev=elev, azim=azim)
+        ax3d.tick_params(colors=_TEXT, labelsize=6)
+        for axis in (ax3d.xaxis, ax3d.yaxis, ax3d.zaxis):
+            axis.pane.set_facecolor(_SURFACE)
+            axis.pane.set_edgecolor(_GRID)
+            axis.line.set_color(_GRID)
+        ax3d.grid(color=_GRID)
 
-    # --- Panel 2: bird's-eye view (X vs depth Z) ------------------------
-    ax_bev = fig.add_subplot(1, 2, 2)
-    ax_bev.set_facecolor(_SURFACE)
-    ax_bev.scatter(pts[:, 0], pts[:, 2], c=colors, s=point_size + 0.5, marker=".", linewidths=0)
-    ax_bev.invert_yaxis()  # near depth at bottom, far depth toward the top
-    ax_bev.set_xlabel("X (m)", color=_TEXT, fontsize=8)
-    ax_bev.set_ylabel("Depth Z (m)", color=_TEXT, fontsize=8)
-    ax_bev.set_title("Bird's-eye view", color=_TEXT, fontsize=10)
-    ax_bev.tick_params(colors=_TEXT, labelsize=7)
-    ax_bev.grid(color=_GRID, linewidth=0.5)
-    for spine in ax_bev.spines.values():
-        spine.set_color(_GRID)
-    ax_bev.set_aspect("equal", adjustable="datalim")
+        # --- Panel 2: bird's-eye view (X vs depth Z) ------------------------
+        ax_bev = fig.add_subplot(1, 2, 2)
+        ax_bev.set_facecolor(_SURFACE)
+        ax_bev.scatter(pts[:, 0], pts[:, 2], c=colors, s=point_size + 0.5, marker=".", linewidths=0)
+        ax_bev.invert_yaxis()  # near depth at bottom, far depth toward the top
+        ax_bev.set_xlabel("X (m)", color=_TEXT, fontsize=8)
+        ax_bev.set_ylabel("Depth Z (m)", color=_TEXT, fontsize=8)
+        ax_bev.set_title("Bird's-eye view", color=_TEXT, fontsize=10)
+        ax_bev.tick_params(colors=_TEXT, labelsize=7)
+        ax_bev.grid(color=_GRID, linewidth=0.5)
+        for spine in ax_bev.spines.values():
+            spine.set_color(_GRID)
+        ax_bev.set_aspect("equal", adjustable="datalim")
 
-    fig.tight_layout()
+        fig.tight_layout()
 
-    buf = BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return buf.getvalue()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        return buf.getvalue()
+    except Exception:
+        # A broken/partial matplotlib 3D install (system + pip matplotlib
+        # both present with mismatched mpl_toolkits -- see
+        # visualization.camera_frustum's module docstring for the full
+        # explanation) can fail inside `projection="3d"` itself, not just
+        # at an explicit import. Degrade to "no image" rather than
+        # crashing the whole visual-generation step over one panel.
+        return None
+    finally:
+        # Always close, even if a plotting call above raises -- otherwise
+        # the figure leaks in matplotlib's global pyplot state.
+        plt.close(fig)
 
 
 def render_colorized_pointcloud_from_frame(

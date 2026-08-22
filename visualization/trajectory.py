@@ -53,35 +53,39 @@ def render_m4_trajectory_png(m4_result, dpi: int = 130) -> Optional[bytes]:
     floor_px = m4_result.floor_px
 
     fig, ax = plt.subplots(figsize=(8.2, 3.2), dpi=dpi)
-    fig.patch.set_facecolor(_BG)
-    ax.set_facecolor(_SURFACE)
+    try:
+        fig.patch.set_facecolor(_BG)
+        ax.set_facecolor(_SURFACE)
 
-    if floor_px and np.isfinite(floor_px) and floor_px > 0:
-        good_line = M2_GOOD_MULTIPLIER * floor_px
-        warn_line = M2_WARNING_MULTIPLIER * floor_px
-        y_max = max(values.max(), warn_line) * 1.15
-        ax.axhspan(0, good_line, color=_GOOD, alpha=0.08, zorder=0)
-        ax.axhspan(good_line, warn_line, color=_WARNING, alpha=0.08, zorder=0)
-        ax.axhspan(warn_line, y_max, color=_BAD, alpha=0.08, zorder=0)
-        ax.set_ylim(0, y_max)
+        if floor_px and np.isfinite(floor_px) and floor_px > 0:
+            good_line = M2_GOOD_MULTIPLIER * floor_px
+            warn_line = M2_WARNING_MULTIPLIER * floor_px
+            y_max = max(values.max(), warn_line) * 1.15
+            ax.axhspan(0, good_line, color=_GOOD, alpha=0.08, zorder=0)
+            ax.axhspan(good_line, warn_line, color=_WARNING, alpha=0.08, zorder=0)
+            ax.axhspan(warn_line, y_max, color=_BAD, alpha=0.08, zorder=0)
+            ax.set_ylim(0, y_max)
 
-    ax.plot(indices, values, color=_TEXT, linewidth=1.2, zorder=2, alpha=0.85)
-    ax.scatter(indices[~is_outlier], values[~is_outlier], color="#7DD3FC", s=14, zorder=3,
-               label="frame")
-    if is_outlier.any():
-        ax.scatter(indices[is_outlier], values[is_outlier], color=_BAD, s=32, zorder=4,
-                   marker="x", linewidths=2, label="outlier")
-        ax.legend(loc="upper left", frameon=False, labelcolor=_TEXT, fontsize=8)
+        ax.plot(indices, values, color=_TEXT, linewidth=1.2, zorder=2, alpha=0.85)
+        ax.scatter(indices[~is_outlier], values[~is_outlier], color="#7DD3FC", s=14, zorder=3,
+                   label="frame")
+        if is_outlier.any():
+            ax.scatter(indices[is_outlier], values[is_outlier], color=_BAD, s=32, zorder=4,
+                       marker="x", linewidths=2, label="outlier")
+            ax.legend(loc="upper left", frameon=False, labelcolor=_TEXT, fontsize=8)
 
-    ax.set_xlabel("frame index", color=_TEXT, fontsize=9)
-    ax.set_ylabel("mean error (px)", color=_TEXT, fontsize=9)
-    ax.tick_params(colors=_TEXT, labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_color(_GRID)
-    ax.grid(True, color=_GRID, linewidth=0.5, alpha=0.6)
-    fig.tight_layout()
+        ax.set_xlabel("frame index", color=_TEXT, fontsize=9)
+        ax.set_ylabel("mean error (px)", color=_TEXT, fontsize=9)
+        ax.tick_params(colors=_TEXT, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(_GRID)
+        ax.grid(True, color=_GRID, linewidth=0.5, alpha=0.6)
+        fig.tight_layout()
 
-    buf = BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return buf.getvalue()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        return buf.getvalue()
+    finally:
+        # Always close, even if a plotting call above raises -- otherwise
+        # the figure leaks in matplotlib's global pyplot state.
+        plt.close(fig)

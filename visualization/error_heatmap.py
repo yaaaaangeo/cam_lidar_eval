@@ -76,24 +76,40 @@ def compute_error_grid(
 
     cell_h = image_height / grid_rows
     cell_w = image_width / grid_cols
+    n_cells = grid_rows * grid_cols
 
     mean_grid = np.full((grid_rows, grid_cols), np.nan)
     counts = np.zeros((grid_rows, grid_cols), dtype=int)
 
     if edge_pixels.shape[0] > 0:
-        col_idx = np.clip((edge_pixels[:, 0] / cell_w).astype(int), 0, grid_cols - 1)
-        row_idx = np.clip((edge_pixels[:, 1] / cell_h).astype(int), 0, grid_rows - 1)
         in_bounds = (
             (edge_pixels[:, 0] >= 0) & (edge_pixels[:, 0] < image_width) &
             (edge_pixels[:, 1] >= 0) & (edge_pixels[:, 1] < image_height)
         )
-        for r in range(grid_rows):
-            for c in range(grid_cols):
-                mask = in_bounds & (row_idx == r) & (col_idx == c)
-                n = int(mask.sum())
-                counts[r, c] = n
-                if n >= min_points_per_cell:
-                    mean_grid[r, c] = float(errors_px[mask].mean())
+        if in_bounds.any():
+            px = edge_pixels[in_bounds]
+            err = errors_px[in_bounds]
+            col_idx = np.clip((px[:, 0] / cell_w).astype(int), 0, grid_cols - 1)
+            row_idx = np.clip((px[:, 1] / cell_h).astype(int), 0, grid_rows - 1)
+            flat_idx = row_idx * grid_cols + col_idx
+
+            # Vectorized per-cell sum/count via np.bincount -- the same
+            # vectorization pattern evaluation.edge_alignment's
+            # extract_lidar_edge_points already uses (np.maximum.at/
+            # np.minimum.at there; np.bincount here, same idea: replace a
+            # Python-level loop that re-masks the full point array on
+            # every iteration with one C-level reduction). Turns this
+            # from O(grid_rows * grid_cols * N) into O(N + grid_rows *
+            # grid_cols), which only matters at finer grid resolutions
+            # than the default 6x8, but costs nothing extra either way.
+            flat_counts = np.bincount(flat_idx, minlength=n_cells)
+            flat_sums = np.bincount(flat_idx, weights=err, minlength=n_cells)
+
+            counts = flat_counts.reshape(grid_rows, grid_cols)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                flat_means = flat_sums / flat_counts
+            flat_means[flat_counts < min_points_per_cell] = np.nan
+            mean_grid = flat_means.reshape(grid_rows, grid_cols)
 
     return ErrorGridResult(
         mean_err_px=mean_grid,

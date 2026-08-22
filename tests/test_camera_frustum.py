@@ -9,10 +9,10 @@ from visualization.camera_frustum import (
     compute_frustum_geometry,
     render_camera_frustum_png,
     render_camera_frustum_from_dataset,
-    FrustumGeometry,
+    auto_frustum_depth,
 )
 from input.camera import CameraIntrinsics
-from tests.test_holdout_consistency import _make_dataset, _make_camera
+from tests.test_holdout_consistency import _make_dataset
 
 
 WIDTH, HEIGHT = 640, 480
@@ -85,12 +85,23 @@ def test_render_camera_frustum_png_subsamples_large_clouds():
     assert png[:8] == b"\x89PNG\r\n\x1a\n"
 
 
+def test_auto_frustum_depth_uses_75th_percentile_of_point_depths():
+    points = np.zeros((100, 3))
+    points[:, 2] = np.linspace(1.0, 41.0, 100)  # depths 1..41 in the lidar/camera frame (identity T_CL)
+    depth = auto_frustum_depth(points, np.eye(4))
+    assert np.isclose(depth, np.percentile(points[:, 2], 75))
+
+
+def test_auto_frustum_depth_falls_back_when_no_points():
+    assert auto_frustum_depth(None, np.eye(4), fallback=12.0) == 12.0
+    assert auto_frustum_depth(np.zeros((0, 3)), np.eye(4), fallback=12.0) == 12.0
+
+
 def test_auto_depth_used_when_depth_m_not_given():
     # With no explicit depth_m, points_lidar's depth distribution should
-    # drive the frustum size (implicitly exercised via no exception and a
-    # valid PNG; explicit numeric check done through compute_frustum_geometry
-    # directly for the auto-depth helper isn't exposed publicly, so this
-    # is a smoke test of the auto-depth code path in render).
+    # drive the frustum size -- exercised end-to-end here (via no
+    # exception and a valid PNG); auto_frustum_depth itself is unit-tested
+    # directly above.
     points = np.zeros((100, 3))
     points[:, 2] = 20.0  # all points far away
     png = render_camera_frustum_png(np.eye(4), _K(), WIDTH, HEIGHT, points_lidar=points)
@@ -111,3 +122,80 @@ def test_render_camera_frustum_from_dataset_raises_on_empty_dataset():
         assert False, "expected ValueError for empty dataset"
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Graceful degradation when mpl_toolkits.mplot3d isn't usable in this
+# environment (e.g. a system + pip matplotlib version mismatch -- see the
+# module docstring / _MPL3D_AVAILABLE comment in visualization.camera_frustum)
+# ---------------------------------------------------------------------------
+
+def test_render_camera_frustum_png_returns_none_when_mpl3d_unavailable():
+    import visualization.camera_frustum as cf
+    original = cf._MPL3D_AVAILABLE
+    cf._MPL3D_AVAILABLE = False
+    try:
+        png = cf.render_camera_frustum_png(np.eye(4), _K(), WIDTH, HEIGHT, depth_m=8.0)
+        assert png is None
+    finally:
+        cf._MPL3D_AVAILABLE = original
+
+
+def test_render_camera_frustum_from_dataset_returns_none_when_mpl3d_unavailable():
+    import visualization.camera_frustum as cf
+    original = cf._MPL3D_AVAILABLE
+    cf._MPL3D_AVAILABLE = False
+    try:
+        dataset = _make_dataset([0.0] * 10)
+        png = cf.render_camera_frustum_from_dataset(dataset)
+        assert png is None
+        # still raises for an empty dataset even in the degraded-3D state --
+        # that's a caller bug, not an environment issue, and shouldn't be
+        # silently swallowed into a None
+        empty_dataset = _make_dataset([])
+        try:
+            cf.render_camera_frustum_from_dataset(empty_dataset)
+            assert False, "expected ValueError for empty dataset"
+        except ValueError:
+            pass
+    finally:
+        cf._MPL3D_AVAILABLE = original
+
+
+def test_render_camera_frustum_png_returns_none_on_unexpected_plotting_error():
+    """Even with mpl_toolkits importable, some OTHER failure inside the
+    plotting call (e.g. `projection='3d'` registration itself failing in a
+    genuinely broken environment) must also degrade to None, not crash the
+    caller -- simulated here by forcing add_subplot to raise."""
+    import visualization.camera_frustum as cf
+    import matplotlib.figure
+
+    original_add_subplot = matplotlib.figure.Figure.add_subplot
+
+    def _broken_add_subplot(self, *args, **kwargs):
+        raise RuntimeError("simulated broken 3d projection registration")
+
+    matplotlib.figure.Figure.add_subplot = _broken_add_subplot
+    try:
+        png = cf.render_camera_frustum_png(np.eye(4), _K(), WIDTH, HEIGHT, depth_m=8.0)
+        assert png is None
+    finally:
+        matplotlib.figure.Figure.add_subplot = original_add_subplot
+
+
+if __name__ == "__main__":
+    test_fns = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
+    passed, failed = 0, 0
+    for fn in test_fns:
+        try:
+            fn()
+            print(f"PASS  {fn.__name__}")
+            passed += 1
+        except AssertionError as e:
+            print(f"FAIL  {fn.__name__}: {e}")
+            failed += 1
+        except Exception as e:
+            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
+            failed += 1
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)

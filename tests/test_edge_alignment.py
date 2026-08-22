@@ -216,6 +216,134 @@ def test_edge_alignment_result_carries_floor_and_classification_consistently():
     assert result.classification in ("GOOD", "WARNING", "BAD")
 
 
+# ---------------------------------------------------------------------------
+# STEP7 -- Noise/Uncertainty Model: per-point expected noise + normalized error
+# ---------------------------------------------------------------------------
+
+def test_edge_alignment_carries_per_point_uncertainty_fields():
+    camera, image, points_lidar, lidar_spec = _make_synthetic_scene()
+    result = evaluate_edge_alignment(
+        image=image, points_lidar=points_lidar, T_CL=np.eye(4),
+        camera=camera, lidar_spec=lidar_spec, depth_jump_threshold_m=1.0,
+    )
+    assert result.edge_point_floor_px is not None
+    assert result.edge_point_normalized_errors is not None
+    assert result.edge_point_depths_m is not None
+    assert result.edge_point_matched is not None
+    assert result.edge_point_matched.shape == (result.num_edge_points,)
+    assert result.edge_point_matched.sum() == result.num_matched
+    assert result.edge_point_floor_px.shape == (result.num_edge_points,)
+    assert result.edge_point_normalized_errors.shape == (result.num_edge_points,)
+    assert result.edge_point_depths_m.shape == (result.num_edge_points,)
+    assert np.all(result.edge_point_floor_px > 0)
+    assert np.all(result.edge_point_depths_m > 0)
+    assert result.mean_normalized_error is not None
+    assert result.median_normalized_error is not None
+    assert result.p95_normalized_error is not None
+    assert result.mean_normalized_error >= 0
+
+
+def test_edge_alignment_normalized_error_matches_manual_division():
+    camera, image, points_lidar, lidar_spec = _make_synthetic_scene()
+    result = evaluate_edge_alignment(
+        image=image, points_lidar=points_lidar, T_CL=np.eye(4),
+        camera=camera, lidar_spec=lidar_spec, depth_jump_threshold_m=1.0,
+    )
+    manual = result.edge_point_errors_px / result.edge_point_floor_px
+    assert np.allclose(result.edge_point_normalized_errors, manual)
+
+
+def test_edge_alignment_per_point_floor_matches_direct_computation_at_shared_depth():
+    """In this scene, M2's edge extraction keeps only the NEAR-SIDE of the
+    depth discontinuity (by design -- see extract_lidar_edge_points'
+    docstring), so every edge point shares the same depth (z_near=5.0m).
+    edge_point_floor_px should then be UNIFORM across all points and
+    match quality.noise_floor.compute_floor called directly at that same
+    depth -- a cross-check against the STEP7-specific unit tests in
+    test_noise_floor.py (which use varying synthetic depths directly,
+    where this scene's fixed geometry can't)."""
+    from quality.noise_floor import resolve_floor_inputs, compute_floor
+    camera, image, points_lidar, lidar_spec = _make_synthetic_scene()
+    result = evaluate_edge_alignment(
+        image=image, points_lidar=points_lidar, T_CL=np.eye(4),
+        camera=camera, lidar_spec=lidar_spec, depth_jump_threshold_m=1.0,
+    )
+    assert np.allclose(result.edge_point_depths_m, 5.0)
+    assert np.allclose(result.edge_point_floor_px, result.edge_point_floor_px[0])
+
+    floor_inputs = resolve_floor_inputs(fx_px=camera.intrinsics.fx, T_CL=np.eye(4), lidar_spec=lidar_spec,
+                                         edge_localization_floor_px=camera.edge_localization_floor_px)
+    expected_floor = compute_floor(floor_inputs, 5.0)  # z_near from _make_synthetic_scene
+    assert np.isclose(result.edge_point_floor_px[0], expected_floor, rtol=1e-6)
+
+
+def test_edge_alignment_uncertainty_fields_none_on_fail():
+    camera, image, _, lidar_spec = _make_synthetic_scene()
+    result = evaluate_edge_alignment(
+        image=image, points_lidar=np.zeros((0, 3)), T_CL=np.eye(4),
+        camera=camera, lidar_spec=lidar_spec,
+    )
+    assert result.classification == "FAIL"
+    assert result.edge_point_floor_px is None
+    assert result.edge_point_normalized_errors is None
+    assert result.edge_point_depths_m is None
+    assert result.mean_normalized_error is None
+
+
+# ---------------------------------------------------------------------------
+# STEP8 -- Dynamic Object Filtering: dynamic_mask parameter
+# ---------------------------------------------------------------------------
+
+def test_edge_alignment_dynamic_mask_excludes_flagged_points():
+    camera, image, points_lidar, lidar_spec = _make_synthetic_scene()
+    # flag every point in the "near" (left) half as dynamic
+    dynamic_mask = points_lidar[:, 2] < 7.0  # z_near=5.0 points
+
+    baseline = evaluate_edge_alignment(
+        image=image, points_lidar=points_lidar, T_CL=np.eye(4),
+        camera=camera, lidar_spec=lidar_spec, depth_jump_threshold_m=1.0,
+    )
+    filtered = evaluate_edge_alignment(
+        image=image, points_lidar=points_lidar, T_CL=np.eye(4),
+        camera=camera, lidar_spec=lidar_spec, depth_jump_threshold_m=1.0,
+        dynamic_mask=dynamic_mask,
+    )
+    # removing all near-side points removes the only edge points this
+    # scene has (the discontinuity's near side is what M2 keeps) -> FAIL
+    assert baseline.classification != "FAIL"
+    assert filtered.classification == "FAIL"
+    assert "No LiDAR points projected" in filtered.warnings[0] or "edge points found" in filtered.warnings[0]
+
+
+def test_edge_alignment_dynamic_mask_all_false_matches_no_mask():
+    camera, image, points_lidar, lidar_spec = _make_synthetic_scene()
+    no_mask_result = evaluate_edge_alignment(
+        image=image, points_lidar=points_lidar, T_CL=np.eye(4),
+        camera=camera, lidar_spec=lidar_spec, depth_jump_threshold_m=1.0,
+    )
+    all_false_mask = np.zeros(points_lidar.shape[0], dtype=bool)
+    masked_result = evaluate_edge_alignment(
+        image=image, points_lidar=points_lidar, T_CL=np.eye(4),
+        camera=camera, lidar_spec=lidar_spec, depth_jump_threshold_m=1.0,
+        dynamic_mask=all_false_mask,
+    )
+    assert np.isclose(no_mask_result.mean_px, masked_result.mean_px)
+    assert no_mask_result.num_edge_points == masked_result.num_edge_points
+
+
+def test_edge_alignment_dynamic_mask_rejects_length_mismatch():
+    camera, image, points_lidar, lidar_spec = _make_synthetic_scene()
+    bad_mask = np.zeros(5, dtype=bool)  # wrong length
+    try:
+        evaluate_edge_alignment(
+            image=image, points_lidar=points_lidar, T_CL=np.eye(4),
+            camera=camera, lidar_spec=lidar_spec, dynamic_mask=bad_mask,
+        )
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":
     test_fns = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
     passed, failed = 0, 0

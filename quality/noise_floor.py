@@ -231,6 +231,34 @@ def compute_floor(inputs: FloorInputs, z_m: float) -> float:
     return math.sqrt(t1 ** 2 + t2 ** 2 + t3 ** 2)
 
 
+def compute_floor_array(inputs: FloorInputs, z_m: np.ndarray) -> np.ndarray:
+    """
+    STEP7 -- Noise/Uncertainty Model: vectorized floor(Z) evaluated at
+    EVERY individual point's own depth, not just one frame-representative
+    distance. This is what turns floor(Z) from "a single number used to
+    classify the frame's aggregate error" into "an expected-noise value
+    PER POINT", which is the basis for normalized_error = actual_error /
+    expected_noise (see evaluation.edge_alignment's per-point
+    normalized-error fields) -- the same raw pixel error means something
+    very different for a point whose own depth gives it a small floor
+    (tight sensor precision there, so 1.8px of actual error is a real
+    problem) vs one with a large floor (loose precision at that range, so
+    1.8px is unremarkable, expected sensor noise).
+
+    z_m must be strictly positive everywhere (same requirement as
+    floor_range/compute_floor for a single value) -- raises ValueError if
+    any entry is <= 0, same as the scalar function, rather than silently
+    producing inf/nan for bad inputs.
+    """
+    z_m = np.asarray(z_m, dtype=np.float64)
+    if z_m.size > 0 and np.any(z_m <= 0):
+        raise ValueError(f"z_m must be strictly positive everywhere, got min={z_m.min()}")
+    t1 = floor_angular(inputs)
+    t2 = inputs.fx_px * inputs.baseline_m * inputs.sigma_r_m / (z_m ** 2)
+    t3 = floor_edge(inputs)
+    return np.sqrt(t1 ** 2 + t2 ** 2 + t3 ** 2)
+
+
 @dataclass
 class FloorBreakdown:
     """Full breakdown of a floor(Z) computation, useful for diagnostics/report."""

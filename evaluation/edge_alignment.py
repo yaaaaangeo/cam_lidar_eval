@@ -10,10 +10,16 @@ Pipeline:
   1. Project all LiDAR points into the image (geometry.projection).
   2. Identify which projected points sit on a LiDAR-side depth discontinuity
      (i.e. correspond to an object silhouette / occlusion boundary).
-  3. Extract image edges (Canny) and build a distance-transform map.
-  4. Sample the distance-transform value at each LiDAR edge point's pixel
-     location -- this is the per-point alignment error, in pixels.
-  5. Aggregate (mean/median/P95) and classify against the sensor-relative
+  3. Match each LiDAR edge point to the image edge it actually corresponds
+     to. Default (STEP6, use_correspondence_matching=True): candidate
+     search across growing radii + orientation agreement + gradient
+     strength + local consistency (evaluation.edge_correspondence) --
+     this is the "does this LiDAR boundary actually correspond to THIS
+     image edge, not just whichever edge happens to be nearest" upgrade
+     over the original pure nearest-distance lookup, which is still
+     available (use_correspondence_matching=False) via
+     compute_distance_transform + sample_bilinear below.
+  4. Aggregate (mean/median/P95) and classify against the sensor-relative
      floor(Z) thresholds (quality.noise_floor), using the GOOD/WARNING/BAD
      multipliers specified for M2 (2x / 5x).
 """
@@ -33,6 +39,7 @@ from quality.noise_floor import (
     LidarSensorSpecForFloor,
     resolve_floor_inputs,
     compute_floor,
+    compute_floor_array,
     classify,
     M2_GOOD_MULTIPLIER,
     M2_WARNING_MULTIPLIER,
@@ -185,6 +192,31 @@ class EdgeAlignmentResult:
     edge_point_pixels: Optional[np.ndarray] = None
     edge_point_errors_px: Optional[np.ndarray] = None
 
+    # STEP6 -- correspondence-matching diagnostics (evaluation.edge_correspondence).
+    # None when use_correspondence_matching=False (old nearest-distance mode),
+    # so downstream consumers can tell which matching engine actually ran.
+    num_matched: Optional[int] = None
+    num_unmatched: Optional[int] = None
+    match_rate: Optional[float] = None
+    edge_point_matched: Optional[np.ndarray] = None
+
+    # STEP7 -- Noise/Uncertainty Model: per-point expected sensor noise
+    # (quality.noise_floor.compute_floor_array, evaluated at each edge
+    # point's OWN depth rather than one frame-representative distance)
+    # and the resulting normalized_error = actual_error / expected_noise.
+    # A raw pixel error means something different depending on how much
+    # noise was expected AT THAT POINT'S OWN RANGE -- normalized_error is
+    # what actually answers "is this error bigger than sensor noise would
+    # explain" on a per-point basis, distinct from floor_px above (which
+    # stays the single frame-representative value M2's aggregate
+    # mean_px/classification are judged against, unchanged from before).
+    edge_point_floor_px: Optional[np.ndarray] = None
+    edge_point_normalized_errors: Optional[np.ndarray] = None
+    edge_point_depths_m: Optional[np.ndarray] = None
+    mean_normalized_error: Optional[float] = None
+    median_normalized_error: Optional[float] = None
+    p95_normalized_error: Optional[float] = None
+
 
 def evaluate_edge_alignment(
     image: np.ndarray,
@@ -198,15 +230,56 @@ def evaluate_edge_alignment(
     depth_jump_threshold_m: float = 0.3,
     min_neighbors: int = 3,
     min_edge_points: int = 100,
+    use_correspondence_matching: bool = True,
+    correspondence_radii_px: tuple[float, ...] = (5.0, 10.0, 15.0),
+    max_orientation_diff_deg: float = 30.0,
+    k_orientation: int = 6,
+    k_consistency: int = 5,
+    max_consistency_angle_deg: float = 45.0,
+    max_consistency_magnitude_ratio: float = 3.0,
+    dynamic_mask: Optional[np.ndarray] = None,
 ) -> EdgeAlignmentResult:
     """
     Compute the M2 Edge Alignment metric for a single synced frame.
 
+    use_correspondence_matching (default True): STEP6's candidate-search +
+    orientation + gradient-strength + local-consistency matcher
+    (evaluation.edge_correspondence.match_lidar_edges_to_image) replaces
+    the original pure nearest-distance lookup. Points with no surviving
+    correspondence are penalized at max(correspondence_radii_px) rather
+    than silently excluded (see edge_correspondence's module docstring
+    for why) -- num_matched/num_unmatched/match_rate on the result report
+    how many points that affected. Set False to use the original
+    compute_distance_transform + sample_bilinear nearest-distance method
+    instead (kept for comparison/back-compat; num_matched etc. stay None
+    in that mode).
+
     Returns an EdgeAlignmentResult. If there aren't enough valid LiDAR edge
     points (per spec's M2 failure condition), classification is "FAIL" and
     the px statistics are NaN.
+
+    dynamic_mask: STEP8 -- optional boolean array aligned with
+    points_lidar (True = this point belongs to a moving object, exclude
+    it entirely before edge extraction/matching). See
+    evaluation.dynamic_filter for how to build one (either
+    classify_points_by_motion_consistency's multi-frame approach, or an
+    externally-supplied detector's own labels via
+    apply_external_dynamic_mask). None (default) applies no filtering --
+    exactly today's behavior. Dynamic points are REMOVED, not penalized
+    like STEP6's unmatched points are -- a point on a moving object isn't
+    "a bad correspondence", it's not evidence about the calibration at
+    all, so counting it against the score either way would be wrong.
     """
     warnings: list[str] = []
+
+    if dynamic_mask is not None:
+        dynamic_mask = np.asarray(dynamic_mask, dtype=bool)
+        if dynamic_mask.shape[0] != points_lidar.shape[0]:
+            raise ValueError(
+                f"dynamic_mask length ({dynamic_mask.shape[0]}) must match "
+                f"points_lidar length ({points_lidar.shape[0]})"
+            )
+        points_lidar = points_lidar[~dynamic_mask]
 
     projection: ProjectionResult = project_lidar_to_image(
         points_lidar=points_lidar,
@@ -245,8 +318,38 @@ def evaluate_edge_alignment(
         return _fail_result(warnings, num_projected_points=projection.num_valid_points,
                              num_edge_points=num_edge_points)
 
-    dt = compute_distance_transform(edge_map)
-    errors_px = sample_bilinear(dt, edge_pixels)
+    num_matched: Optional[int] = None
+    num_unmatched: Optional[int] = None
+    match_rate: Optional[float] = None
+    edge_point_matched: Optional[np.ndarray] = None
+
+    if use_correspondence_matching:
+        from evaluation.edge_correspondence import match_lidar_edges_to_image  # local import avoids a cycle at module load
+        correspondence = match_lidar_edges_to_image(
+            edge_pixels, image,
+            canny_low=canny_low, canny_high=canny_high,
+            radii_px=correspondence_radii_px, max_orientation_diff_deg=max_orientation_diff_deg,
+            k_orientation=k_orientation, k_consistency=k_consistency,
+            max_consistency_angle_deg=max_consistency_angle_deg,
+            max_consistency_magnitude_ratio=max_consistency_magnitude_ratio,
+            edge_mask=edge_map,
+        )
+        errors_px = correspondence.distance_px
+        edge_point_matched = correspondence.matched
+        num_matched = int(correspondence.matched.sum())
+        num_unmatched = num_edge_points - num_matched
+        match_rate = num_matched / num_edge_points if num_edge_points > 0 else 0.0
+        if match_rate < 0.5:
+            warnings.append(
+                f"Only {num_matched}/{num_edge_points} LiDAR edge points found a valid "
+                f"correspondence (orientation- and consistency-checked); the rest were "
+                f"penalized at the max search radius ({max(correspondence_radii_px)}px). "
+                f"A low match rate can mean the calibration is genuinely off, or that "
+                f"max_orientation_diff_deg/correspondence_radii_px need tuning for this scene."
+            )
+    else:
+        dt = compute_distance_transform(edge_map)
+        errors_px = sample_bilinear(dt, edge_pixels)
 
     representative_depth_m = float(np.median(edge_depths))
 
@@ -258,6 +361,17 @@ def evaluate_edge_alignment(
     )
     warnings.extend(floor_inputs.fallback_warnings)
     floor_px = compute_floor(floor_inputs, representative_depth_m)
+
+    # STEP7 -- per-point expected noise + normalized error, evaluated at
+    # each point's OWN depth rather than the single frame-representative
+    # value above. edge_depths are already guaranteed > 0 here (project_
+    # lidar_to_image's min_depth_m filter excludes non-positive depths
+    # before a point can ever reach extract_lidar_edge_points).
+    edge_point_floor_px = compute_floor_array(floor_inputs, edge_depths)
+    edge_point_normalized_errors = errors_px / edge_point_floor_px
+    mean_normalized_error = float(np.mean(edge_point_normalized_errors))
+    median_normalized_error = float(np.median(edge_point_normalized_errors))
+    p95_normalized_error = float(np.percentile(edge_point_normalized_errors, 95))
 
     mean_px = float(np.mean(errors_px))
     median_px = float(np.median(errors_px))
@@ -279,6 +393,16 @@ def evaluate_edge_alignment(
         warnings=warnings,
         edge_point_pixels=edge_pixels,
         edge_point_errors_px=errors_px,
+        num_matched=num_matched,
+        num_unmatched=num_unmatched,
+        match_rate=match_rate,
+        edge_point_matched=edge_point_matched,
+        edge_point_floor_px=edge_point_floor_px,
+        edge_point_normalized_errors=edge_point_normalized_errors,
+        edge_point_depths_m=edge_depths,
+        mean_normalized_error=mean_normalized_error,
+        median_normalized_error=median_normalized_error,
+        p95_normalized_error=p95_normalized_error,
     )
 
 

@@ -30,7 +30,7 @@ from typing import Optional
 import numpy as np
 
 from visualization.colorized_pointcloud import colorize_lidar_points
-from visualization.camera_frustum import compute_frustum_geometry, _auto_depth
+from visualization.camera_frustum import compute_frustum_geometry, auto_frustum_depth
 
 
 _BG = "#0D1117"
@@ -84,7 +84,7 @@ def build_interactive_scene(
     )
 
     if depth_m is None:
-        depth_m = _auto_depth(points_lidar, T_CL)
+        depth_m = auto_frustum_depth(points_lidar, T_CL)
     geom = compute_frustum_geometry(T_CL, camera.K(), camera.width, camera.height, depth_m)
 
     traces: list[dict] = []

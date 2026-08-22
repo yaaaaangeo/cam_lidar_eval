@@ -46,29 +46,34 @@ def render_error_histogram_png(
         return None
 
     fig, ax = plt.subplots(figsize=(8.2, 3.0), dpi=dpi)
-    fig.patch.set_facecolor(_BG)
-    ax.set_facecolor(_SURFACE)
+    try:
+        fig.patch.set_facecolor(_BG)
+        ax.set_facecolor(_SURFACE)
 
-    ax.hist(errors_px, bins=bins, color=_ACCENT, alpha=0.85, zorder=3)
+        ax.hist(errors_px, bins=bins, color=_ACCENT, alpha=0.85, zorder=3)
 
-    if floor_px and np.isfinite(floor_px) and floor_px > 0:
-        good_line = good_mult * floor_px
-        warn_line = warning_mult * floor_px
-        ax.axvline(good_line, color=_GOOD, linestyle="--", linewidth=1.2, zorder=4,
-                   label=f"GOOD boundary ({good_line:.2f}px)")
-        ax.axvline(warn_line, color=_BAD, linestyle="--", linewidth=1.2, zorder=4,
-                   label=f"BAD boundary ({warn_line:.2f}px)")
-        ax.legend(loc="upper right", frameon=False, labelcolor=_TEXT, fontsize=8)
+        if floor_px and np.isfinite(floor_px) and floor_px > 0:
+            good_line = good_mult * floor_px
+            warn_line = warning_mult * floor_px
+            ax.axvline(good_line, color=_GOOD, linestyle="--", linewidth=1.2, zorder=4,
+                       label=f"GOOD boundary ({good_line:.2f}px)")
+            ax.axvline(warn_line, color=_BAD, linestyle="--", linewidth=1.2, zorder=4,
+                       label=f"BAD boundary ({warn_line:.2f}px)")
+            ax.legend(loc="upper right", frameon=False, labelcolor=_TEXT, fontsize=8)
 
-    ax.set_xlabel("per-point error (px)", color=_TEXT, fontsize=9)
-    ax.set_ylabel("point count", color=_TEXT, fontsize=9)
-    ax.tick_params(colors=_TEXT, labelsize=8)
-    for spine in ax.spines.values():
-        spine.set_color(_GRID)
-    ax.grid(True, axis="y", color=_GRID, linewidth=0.5, alpha=0.6)
-    fig.tight_layout()
+        ax.set_xlabel("per-point error (px)", color=_TEXT, fontsize=9)
+        ax.set_ylabel("point count", color=_TEXT, fontsize=9)
+        ax.tick_params(colors=_TEXT, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(_GRID)
+        ax.grid(True, axis="y", color=_GRID, linewidth=0.5, alpha=0.6)
+        fig.tight_layout()
 
-    buf = BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return buf.getvalue()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        return buf.getvalue()
+    finally:
+        # Always close, even if a plotting call above raises -- otherwise
+        # the figure leaks in matplotlib's global pyplot state (it keeps
+        # every un-closed figure alive until the process exits).
+        plt.close(fig)

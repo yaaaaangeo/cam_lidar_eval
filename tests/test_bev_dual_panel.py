@@ -85,3 +85,21 @@ def test_render_bev_dual_panel_from_result_none_when_fail():
     camera, image, points, result = _make_result()
     result.classification = "FAIL"
     assert render_bev_dual_panel_from_result(image, points, np.eye(4), camera, result) is None
+
+
+if __name__ == "__main__":
+    test_fns = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
+    passed, failed = 0, 0
+    for fn in test_fns:
+        try:
+            fn()
+            print(f"PASS  {fn.__name__}")
+            passed += 1
+        except AssertionError as e:
+            print(f"FAIL  {fn.__name__}: {e}")
+            failed += 1
+        except Exception as e:
+            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
+            failed += 1
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)

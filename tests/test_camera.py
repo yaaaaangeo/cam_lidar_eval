@@ -11,6 +11,8 @@ import cv2
 from input.camera import (
     CameraIntrinsics,
     CameraDistortion,
+    CameraModel,
+    CameraSource,
     load_camera_from_image_dir,
     load_camera_from_video,
     load_camera_from_rosbag,
@@ -139,6 +141,51 @@ def test_camera_model_K_and_dist_coeffs():
 def test_camera_distortion_none_model_returns_none_coeffs():
     dist = CameraDistortion(model="none")
     assert dist.as_array() is None
+
+
+def _make_camera_model(width=640, height=480):
+    return CameraModel(
+        width=width, height=height, model="pinhole",
+        intrinsics=CameraIntrinsics(500, 500, width / 2, height / 2),
+        distortion=CameraDistortion(model="none"),
+        source=CameraSource(kind="image_dir", path="."),
+    )
+
+
+def test_verify_image_shape_passes_when_dimensions_match():
+    camera = _make_camera_model(width=640, height=480)
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    camera.verify_image_shape(image)  # should not raise
+
+
+def test_verify_image_shape_raises_on_mismatch():
+    camera = _make_camera_model(width=640, height=480)
+    image = np.zeros((100, 100, 3), dtype=np.uint8)
+    try:
+        camera.verify_image_shape(image)
+        assert False, "expected ValueError"
+    except ValueError as e:
+        # message should mention both the declared and actual dimensions,
+        # since that's the whole point -- an actionable error, not just
+        # "something's wrong"
+        assert "640" in str(e) and "480" in str(e)
+        assert "100" in str(e)
+
+
+def test_verify_image_shape_raises_on_width_only_mismatch():
+    camera = _make_camera_model(width=640, height=480)
+    image = np.zeros((480, 320, 3), dtype=np.uint8)  # height matches, width doesn't
+    try:
+        camera.verify_image_shape(image)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_verify_image_shape_accepts_grayscale_image():
+    camera = _make_camera_model(width=64, height=48)
+    grayscale_image = np.zeros((48, 64), dtype=np.uint8)  # 2D, no channel dim
+    camera.verify_image_shape(grayscale_image)  # should not raise
 
 
 def test_video_loader_raises_not_implemented():

@@ -118,3 +118,67 @@ def test_colorize_lidar_points_retains_lidar_frame_points():
     assert result.points_lidar.shape == (result.num_colorized_points, 3)
     # T_CL is identity here, so lidar-frame and camera-frame points coincide.
     assert np.allclose(result.points_lidar, result.points_cam)
+
+
+def test_colorize_lidar_points_raises_clear_error_on_dimension_mismatch():
+    # image_width/image_height say 640x480, but the actual array passed in
+    # is 100x100 -- this used to raise an opaque IndexError from the
+    # image[py, px] fancy-index below; it should now fail fast with a
+    # message that says what's actually wrong.
+    camera, _, points = _camera_and_image_and_points()
+    wrong_size_image = np.zeros((100, 100, 3), dtype=np.uint8)
+    try:
+        colorize_lidar_points(
+            wrong_size_image, points, T_CL=np.eye(4), K=camera.K(), dist_coeffs=camera.dist_coeffs(),
+            image_width=camera.width, image_height=camera.height, camera_model="pinhole",
+        )
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "640" in str(e) and "480" in str(e)
+        assert "100" in str(e)
+    except IndexError:
+        assert False, "should raise a clear ValueError, not a bare IndexError"
+
+
+def test_render_colorized_pointcloud_png_returns_none_on_broken_3d_env():
+    """A broken/partial matplotlib 3D install (e.g. system + pip matplotlib
+    version mismatch -- see visualization.camera_frustum's module
+    docstring for the full explanation) must degrade this panel to None
+    rather than crash the whole visual-generation step. Simulated by
+    forcing add_subplot to raise, same technique as
+    test_camera_frustum.py's equivalent coverage."""
+    import matplotlib.figure
+    camera, image, points = _camera_and_image_and_points()
+    result = colorize_lidar_points(
+        image, points, T_CL=np.eye(4), K=camera.K(), dist_coeffs=camera.dist_coeffs(),
+        image_width=camera.width, image_height=camera.height, camera_model="pinhole",
+    )
+    original_add_subplot = matplotlib.figure.Figure.add_subplot
+
+    def _broken_add_subplot(self, *args, **kwargs):
+        raise RuntimeError("simulated broken 3d projection registration")
+
+    matplotlib.figure.Figure.add_subplot = _broken_add_subplot
+    try:
+        png = render_colorized_pointcloud_png(result)
+        assert png is None
+    finally:
+        matplotlib.figure.Figure.add_subplot = original_add_subplot
+
+
+if __name__ == "__main__":
+    test_fns = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
+    passed, failed = 0, 0
+    for fn in test_fns:
+        try:
+            fn()
+            print(f"PASS  {fn.__name__}")
+            passed += 1
+        except AssertionError as e:
+            print(f"FAIL  {fn.__name__}: {e}")
+            failed += 1
+        except Exception as e:
+            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
+            failed += 1
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)

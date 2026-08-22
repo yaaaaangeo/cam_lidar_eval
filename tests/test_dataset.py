@@ -54,8 +54,14 @@ def test_build_dataset_within_tolerance_matches():
 
 
 def test_build_dataset_outside_tolerance_dropped():
-    cam_frames = [CameraFrame(timestamp=t) for t in [0.0, 1.0, 2.0]]
-    lid_frames = [LidarFrame(timestamp=t) for t in [0.5, 1.5, 2.5]]  # 500ms off, way outside 50ms
+    # A NON-constant mismatch (alternating +/-500ms, camera frames spaced
+    # far enough apart that nearest-neighbor association is unambiguous):
+    # the median offset bootstrap correctly estimates ~0 here (the +/-
+    # cancel out), so offset correction can't rescue these pairs -- unlike
+    # a genuinely constant offset (see test_sync_estimates_constant_offset),
+    # this is real, uncorrectable desync and must still be dropped.
+    cam_frames = [CameraFrame(timestamp=t) for t in [0.0, 10.0, 20.0, 30.0]]
+    lid_frames = [LidarFrame(timestamp=t) for t in [-0.5, 10.5, 19.5, 30.5]]
     ds = build_dataset(_dummy_camera_model(), cam_frames, _dummy_lidar_model(), lid_frames,
                         _dummy_extrinsic_model(), SyncConfig(max_time_diff_ms=50))
     assert len(ds.frames) == 0
@@ -129,6 +135,143 @@ def test_time_blocks_rejects_zero_or_negative_n():
         assert False, "expected ValueError"
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# STEP 2 -- Timestamp Synchronization: candidate window + monotonic
+# matching + offset estimation (see input/dataset.py's module docstring)
+# ---------------------------------------------------------------------------
+
+def test_sync_matched_indices_are_monotonic():
+    """A naive 'argmin over all unused lidar frames' matcher can produce a
+    NON-monotonic assignment when timestamps interleave awkwardly. The
+    two-pointer matcher must never do this: matched lidar indices must be
+    strictly increasing in camera-index order."""
+    # Camera and lidar rates differ slightly and drift into an order where
+    # a purely-greedy-per-camera-frame argmin could pick lidar frames out
+    # of order (e.g. matching a later lidar frame to an earlier camera
+    # frame because it happened to be marginally closer).
+    cam_ts = [0.0, 0.31, 0.62, 0.93, 1.24]
+    lid_ts = [0.02, 0.30, 0.29, 0.65, 0.90, 1.25]  # 0.29 sits BEFORE 0.30 in time
+    cam_frames = [CameraFrame(timestamp=t) for t in cam_ts]
+    lid_frames = [LidarFrame(timestamp=t) for t in lid_ts]
+    ds = build_dataset(_dummy_camera_model(), cam_frames, _dummy_lidar_model(), lid_frames,
+                        _dummy_extrinsic_model(), SyncConfig(max_time_diff_ms=150))
+    lidar_ts_matched = [sf.lidar_frame.timestamp for sf in ds.frames]
+    assert lidar_ts_matched == sorted(lidar_ts_matched), (
+        f"matched lidar timestamps are not monotonic: {lidar_ts_matched}"
+    )
+    # camera frame order in the result must also be increasing (frames are
+    # re-sorted by camera timestamp at the end of the sync pass)
+    cam_ts_matched = [sf.camera_frame.timestamp for sf in ds.frames]
+    assert cam_ts_matched == sorted(cam_ts_matched)
+
+
+def test_sync_candidate_window_respected():
+    """Even with offset-correction active, a NON-constant mismatch (no
+    consistent Δt to correct for) must still be dropped -- offset
+    correction only rescues a genuinely constant clock offset
+    (test_sync_estimates_constant_offset), never arbitrary large jitter.
+    Uses alternating +/-300ms with camera frames spaced far enough apart
+    that nearest-neighbor association stays unambiguous, so the median
+    bootstrap correctly lands near zero (the +/- cancel out) and offers
+    no correction to rescue these clearly-out-of-window pairs."""
+    cam_frames = [CameraFrame(timestamp=t) for t in [0.0, 10.0, 20.0, 30.0]]
+    lid_frames = [LidarFrame(timestamp=t) for t in [-0.3, 10.3, 19.7, 30.3]]
+    ds = build_dataset(_dummy_camera_model(), cam_frames, _dummy_lidar_model(), lid_frames,
+                        _dummy_extrinsic_model(), SyncConfig(max_time_diff_ms=50))
+    assert len(ds.frames) == 0
+    assert ds.sync_stats.num_matched == 0
+    assert ds.sync_stats.classification == "FAIL"
+
+
+def test_sync_estimates_constant_offset():
+    """A CONSTANT clock offset (every lidar frame exactly 17ms behind its
+    camera counterpart) should be both recovered via the offset-correction
+    pass (frames land back inside a tight window) and reported accurately
+    in estimated_offset_ms, with near-zero offset_std_ms since the offset
+    truly is constant."""
+    offset_s = 0.017  # camera is 17ms AHEAD of lidar clock => Δt = +17ms
+    cam_ts = [float(i) for i in range(20)]
+    lid_ts = [t - offset_s for t in cam_ts]
+    cam_frames = [CameraFrame(timestamp=t) for t in cam_ts]
+    lid_frames = [LidarFrame(timestamp=t) for t in lid_ts]
+
+    # A raw window of 10ms would normally be too tight to catch a 17ms
+    # offset with plain nearest-neighbor -- but the offset-correction pass
+    # re-centers the search, so it should still fully match here.
+    ds = build_dataset(_dummy_camera_model(), cam_frames, _dummy_lidar_model(), lid_frames,
+                        _dummy_extrinsic_model(), SyncConfig(max_time_diff_ms=10))
+    assert ds.sync_stats.num_matched == 20
+    assert abs(ds.sync_stats.estimated_offset_ms - 17.0) < 0.5
+    assert ds.sync_stats.offset_std_ms < 0.5
+    assert ds.sync_stats.classification == "GOOD"
+
+
+def test_sync_offset_sign_convention():
+    """Δt = camera_clock - lidar_clock: if the LIDAR is ahead of the
+    camera (lidar timestamps are numerically larger for the 'same' event),
+    the estimated offset should be NEGATIVE."""
+    cam_ts = [float(i) for i in range(10)]
+    lid_ts = [t + 0.01 for t in cam_ts]  # lidar clock reads 10ms ahead
+    cam_frames = [CameraFrame(timestamp=t) for t in cam_ts]
+    lid_frames = [LidarFrame(timestamp=t) for t in lid_ts]
+    ds = build_dataset(_dummy_camera_model(), cam_frames, _dummy_lidar_model(), lid_frames,
+                        _dummy_extrinsic_model(), SyncConfig(max_time_diff_ms=15))
+    assert ds.sync_stats.estimated_offset_ms < 0
+    assert abs(ds.sync_stats.estimated_offset_ms - (-10.0)) < 0.5
+
+
+def test_sync_drop_ratio_and_classification_warning():
+    cam_frames = [CameraFrame(timestamp=float(i)) for i in range(20)]
+    # only 16/20 camera frames get a lidar match (4 lidar frames simply
+    # missing) -> 20% drop ratio, right at the WARNING boundary
+    lid_ts = [float(i) for i in range(20) if i not in (3, 7, 11, 15)]
+    lid_frames = [LidarFrame(timestamp=t) for t in lid_ts]
+    ds = build_dataset(_dummy_camera_model(), cam_frames, _dummy_lidar_model(), lid_frames,
+                        _dummy_extrinsic_model(), SyncConfig(max_time_diff_ms=50))
+    assert ds.sync_stats.num_matched == 16
+    assert abs(ds.sync_stats.drop_ratio - 0.2) < 1e-9
+    assert ds.sync_stats.classification in ("WARNING", "GOOD")  # boundary-inclusive per classify_sync
+
+
+def test_sync_stats_to_dict_shape():
+    cam_frames = [CameraFrame(timestamp=t) for t in [0.0, 1.0, 2.0]]
+    lid_frames = [LidarFrame(timestamp=t) for t in [0.0, 1.0, 2.0]]
+    ds = build_dataset(_dummy_camera_model(), cam_frames, _dummy_lidar_model(), lid_frames,
+                        _dummy_extrinsic_model(), SyncConfig(max_time_diff_ms=50))
+    d = ds.sync_stats.to_dict()
+    for key in ("num_camera_frames", "num_lidar_frames", "num_matched",
+                "num_camera_dropped", "num_lidar_dropped", "mean_time_diff_ms",
+                "max_time_diff_ms", "estimated_offset_ms", "offset_std_ms",
+                "drop_ratio", "classification"):
+        assert key in d, f"missing key {key!r} in SyncStats.to_dict()"
+    assert d["classification"] == "GOOD"
+    assert d["drop_ratio"] == 0.0
+
+
+def test_sync_large_offset_triggers_warning():
+    """An offset large relative to max_time_diff_ms should surface a
+    dataset-level warning suggesting the person fix it upstream or widen
+    the tolerance -- distinct from the plain 'poor sync' majority-drop
+    warning."""
+    offset_s = 0.04  # 40ms, i.e. 80% of a 50ms window
+    cam_ts = [float(i) for i in range(10)]
+    lid_ts = [t - offset_s for t in cam_ts]
+    cam_frames = [CameraFrame(timestamp=t) for t in cam_ts]
+    lid_frames = [LidarFrame(timestamp=t) for t in lid_ts]
+    ds = build_dataset(_dummy_camera_model(), cam_frames, _dummy_lidar_model(), lid_frames,
+                        _dummy_extrinsic_model(), SyncConfig(max_time_diff_ms=50))
+    assert any("offset" in w.lower() for w in ds.warnings)
+
+
+def test_classify_sync_directly():
+    from input.dataset import classify_sync
+    assert classify_sync(num_matched=0, num_camera_frames=10, offset_std_ms=0.0, max_time_diff_ms=50) == "FAIL"
+    assert classify_sync(num_matched=10, num_camera_frames=10, offset_std_ms=1.0, max_time_diff_ms=50) == "GOOD"
+    assert classify_sync(num_matched=8, num_camera_frames=10, offset_std_ms=1.0, max_time_diff_ms=50) == "WARNING"
+    assert classify_sync(num_matched=5, num_camera_frames=10, offset_std_ms=1.0, max_time_diff_ms=50) == "BAD"
+    assert classify_sync(num_matched=10, num_camera_frames=10, offset_std_ms=40.0, max_time_diff_ms=50) == "BAD"
 
 
 if __name__ == "__main__":

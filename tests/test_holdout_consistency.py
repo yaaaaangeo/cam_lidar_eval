@@ -6,7 +6,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import cv2
 
-from evaluation.holdout_consistency import evaluate_holdout_consistency, MIN_VALID_BLOCKS
+from evaluation.holdout_consistency import (
+    evaluate_holdout_consistency, MIN_VALID_BLOCKS, diagnose_instability, BlockResult,
+)
 from input.camera import CameraModel, CameraIntrinsics, CameraDistortion, CameraSource, CameraFrame
 from input.lidar import LidarSensorSpec, LidarSource, LidarModel, LidarFrame
 from input.extrinsic import ExtrinsicModel, ExtrinsicRaw
@@ -204,6 +206,112 @@ def test_holdout_consistency_block_result_floor_positive_for_valid_blocks():
     for b in result.block_results:
         assert b.floor_px > 0
         assert b.classification in ("GOOD", "WARNING", "BAD")
+
+
+# ---------------------------------------------------------------------------
+# STEP10 -- scene metadata + instability diagnosis
+# ---------------------------------------------------------------------------
+
+def _make_block_result(index, mean_px, depth=15.0, edge_density=50.0, num_points_avg=5000.0,
+                        fov_coverage=0.5, classification="GOOD"):
+    return BlockResult(
+        block_index=index, frame_indices=list(range(index * 10, index * 10 + 10)),
+        num_frames_total=10, num_frames_valid=10, num_frames_failed=0,
+        mean_px=mean_px, median_px=mean_px, p95_px=mean_px * 1.2,
+        num_edge_points=int(edge_density * 10), representative_depth_m=depth,
+        floor_px=1.0, classification=classification,
+        edge_density=edge_density, num_points_avg=num_points_avg, fov_coverage=fov_coverage,
+    )
+
+
+def test_diagnose_instability_identifies_long_range_scenes():
+    blocks = [
+        _make_block_result(0, mean_px=1.0, depth=15.0),
+        _make_block_result(1, mean_px=1.1, depth=14.0),
+        _make_block_result(2, mean_px=1.2, depth=16.0),
+        _make_block_result(3, mean_px=5.0, depth=45.0),  # worst block, also much farther
+    ]
+    diagnosis = diagnose_instability(blocks)
+    assert diagnosis is not None
+    assert diagnosis["worst_block_index"] == 3
+    assert diagnosis["candidates"][0]["metric"] == "representative_depth_m"
+    assert diagnosis["candidates"][0]["explanation"] == "Long-range scenes"
+    assert diagnosis["candidates"][0]["relative_diff"] > 0.5
+
+
+def test_diagnose_instability_identifies_sparse_edge_structure():
+    blocks = [
+        _make_block_result(0, mean_px=1.0, edge_density=200.0),
+        _make_block_result(1, mean_px=1.1, edge_density=210.0),
+        _make_block_result(2, mean_px=1.2, edge_density=190.0),
+        _make_block_result(3, mean_px=5.0, edge_density=20.0),  # worst block, sparse edges
+    ]
+    diagnosis = diagnose_instability(blocks)
+    assert diagnosis is not None
+    top_metrics = [c["metric"] for c in diagnosis["candidates"]]
+    assert "edge_density" in top_metrics
+    edge_candidate = next(c for c in diagnosis["candidates"] if c["metric"] == "edge_density")
+    assert edge_candidate["explanation"] == "Sparse edge structure"
+
+
+def test_diagnose_instability_no_candidates_when_scenes_are_similar():
+    blocks = [
+        _make_block_result(0, mean_px=1.0, depth=15.0, edge_density=100.0),
+        _make_block_result(1, mean_px=1.1, depth=15.5, edge_density=98.0),
+        _make_block_result(2, mean_px=1.2, depth=14.5, edge_density=102.0),
+        _make_block_result(3, mean_px=1.3, depth=15.2, edge_density=99.0),  # worst, but scene is similar
+    ]
+    diagnosis = diagnose_instability(blocks)
+    assert diagnosis is not None
+    assert diagnosis["candidates"] == []
+
+
+def test_diagnose_instability_none_with_too_few_valid_blocks():
+    blocks = [
+        _make_block_result(0, mean_px=1.0),
+        _make_block_result(1, mean_px=5.0),
+    ]
+    assert diagnose_instability(blocks) is None
+
+
+def test_diagnose_instability_ignores_excluded_and_failed_blocks():
+    blocks = [
+        _make_block_result(0, mean_px=1.0, depth=15.0),
+        _make_block_result(1, mean_px=1.1, depth=14.0),
+        _make_block_result(2, mean_px=1.2, depth=16.0),
+        _make_block_result(3, mean_px=999.0, depth=999.0, classification="EXCLUDED"),  # must be ignored
+        _make_block_result(4, mean_px=5.0, depth=45.0),
+    ]
+    diagnosis = diagnose_instability(blocks)
+    assert diagnosis is not None
+    assert diagnosis["worst_block_index"] == 4  # not the EXCLUDED block, despite its huge mean_px
+
+
+def test_holdout_consistency_integration_populates_scene_metadata():
+    drifts = [0.0] * 20 + [0.08] * 20
+    dataset = _make_dataset(drifts)
+    result = evaluate_holdout_consistency(
+        dataset, lidar_spec=_make_lidar_spec(), n_blocks=4, min_frames_per_block=5,
+        edge_alignment_kwargs={"depth_jump_threshold_m": 1.0, "edge_radius_px": 8.0},
+    )
+    for b in result.block_results:
+        if b.classification in ("GOOD", "WARNING", "BAD"):
+            assert np.isfinite(b.edge_density) and b.edge_density > 0
+            assert np.isfinite(b.num_points_avg) and b.num_points_avg > 0
+            assert np.isfinite(b.fov_coverage) and b.fov_coverage >= 0
+            assert b.dynamic_ratio is None  # no dynamic_masks supplied
+
+
+def test_holdout_consistency_result_carries_instability_diagnosis():
+    drifts = [0.0] * 20 + [0.08] * 20
+    dataset = _make_dataset(drifts)
+    result = evaluate_holdout_consistency(
+        dataset, lidar_spec=_make_lidar_spec(), n_blocks=4, min_frames_per_block=5,
+        edge_alignment_kwargs={"depth_jump_threshold_m": 1.0, "edge_radius_px": 8.0},
+    )
+    assert result.instability_diagnosis is not None
+    assert "worst_block_index" in result.instability_diagnosis
+    assert "candidates" in result.instability_diagnosis
 
 
 if __name__ == "__main__":

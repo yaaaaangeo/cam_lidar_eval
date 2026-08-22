@@ -21,6 +21,7 @@ from quality.noise_floor import (
     floor_range,
     floor_edge,
     compute_floor,
+    compute_floor_array,
     compute_floor_breakdown,
     classify,
     multiplier_thresholds,
@@ -191,6 +192,73 @@ def test_compute_floor_is_quadrature_sum():
     t3 = floor_edge(inputs)
     expected = math.sqrt(t1**2 + t2**2 + t3**2)
     assert math.isclose(compute_floor(inputs, z), expected)
+
+
+# ---------------------------------------------------------------------------
+# STEP7 -- compute_floor_array (vectorized, per-point noise/uncertainty model)
+# ---------------------------------------------------------------------------
+
+def test_compute_floor_array_matches_scalar_pointwise():
+    inputs = make_inputs()
+    z_values = np.array([2.0, 5.0, 8.0, 20.0, 50.0])
+    array_result = compute_floor_array(inputs, z_values)
+    scalar_result = np.array([compute_floor(inputs, float(z)) for z in z_values])
+    assert np.allclose(array_result, scalar_result)
+
+
+def test_compute_floor_array_decreases_with_depth():
+    # floor_range's contribution shrinks as 1/Z^2, so floor(Z) should be
+    # monotonically non-increasing with depth (same "distance_independent
+    # angular/edge terms + shrinking range term" logic as the scalar
+    # floor_monotonic_decrease_with_distance test below).
+    inputs = make_inputs()
+    z_values = np.array([1.0, 2.0, 5.0, 10.0, 30.0, 100.0])
+    floors = compute_floor_array(inputs, z_values)
+    assert np.all(np.diff(floors) <= 1e-9)
+
+
+def test_compute_floor_array_empty_input():
+    inputs = make_inputs()
+    result = compute_floor_array(inputs, np.zeros(0))
+    assert result.shape == (0,)
+
+
+def test_compute_floor_array_rejects_nonpositive_depth():
+    inputs = make_inputs()
+    try:
+        compute_floor_array(inputs, np.array([5.0, 0.0, 10.0]))
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+    try:
+        compute_floor_array(inputs, np.array([5.0, -1.0, 10.0]))
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_compute_floor_array_same_point_a_vs_point_b_example():
+    """The exact motivating example from evaluation_metric_spec.md's STEP7:
+    two points with the SAME actual pixel error but different depths (and
+    therefore different expected noise) should normalize to very
+    different normalized_error values -- Point A (large floor, closer to
+    the sensor's angular/edge-dominated regime) reads as unremarkable,
+    Point B (tiny floor, far away where range noise has shrunk to
+    nothing) reads as a real problem."""
+    inputs = make_inputs()
+    z_near = np.array([2.0])   # larger floor(Z) here (range term still significant)
+    z_far = np.array([80.0])   # smaller floor(Z) here (range term negligible at 1/Z^2)
+    floor_near = compute_floor_array(inputs, z_near)[0]
+    floor_far = compute_floor_array(inputs, z_far)[0]
+    assert floor_near > floor_far
+
+    actual_error_px = 1.8
+    normalized_near = actual_error_px / floor_near
+    normalized_far = actual_error_px / floor_far
+    assert normalized_far > normalized_near, (
+        "the same raw pixel error at a farther depth (smaller floor) should "
+        "normalize to a LARGER (more concerning) ratio"
+    )
 
 
 def test_compute_floor_breakdown_identifies_dominant_term_far_range():

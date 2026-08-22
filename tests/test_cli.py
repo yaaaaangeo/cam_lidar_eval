@@ -1,6 +1,8 @@
 import sys
 import os
 import tempfile
+import io
+import contextlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -9,8 +11,8 @@ import cv2
 import yaml
 
 from app.cli import (
-    build_arg_parser, main, _build_demo_dataset, _parse_weights,
-    load_dataset_from_config, run_pipeline,
+    build_arg_parser, main, _build_demo_dataset, _parse_weights, _parse_vec3,
+    load_dataset_from_config, run_pipeline, validate_config_only, ConfigSchemaError,
 )
 
 
@@ -30,6 +32,40 @@ def test_parse_weights_basic():
 def test_parse_weights_handles_spaces():
     result = _parse_weights(" geometry = 1.0 , generalization = 0.0, stability=0.0")
     assert result == {"geometry": 1.0, "generalization": 0.0, "stability": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# _parse_vec3 (STEP5 --deskew-linear-velocity / --deskew-angular-velocity)
+# ---------------------------------------------------------------------------
+
+def test_parse_vec3_none_input():
+    assert _parse_vec3(None, "--deskew-linear-velocity") is None
+
+
+def test_parse_vec3_basic():
+    result = _parse_vec3("1.0,2.0,3.0", "--deskew-linear-velocity")
+    assert np.allclose(result, [1.0, 2.0, 3.0])
+
+
+def test_parse_vec3_handles_spaces_and_negative_numbers():
+    result = _parse_vec3(" -1.5 , 0.0 , 2.25 ", "--deskew-angular-velocity")
+    assert np.allclose(result, [-1.5, 0.0, 2.25])
+
+
+def test_parse_vec3_wrong_component_count_raises():
+    try:
+        _parse_vec3("1.0,2.0", "--deskew-linear-velocity")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "--deskew-linear-velocity" in str(e)
+
+
+def test_parse_vec3_non_numeric_raises():
+    try:
+        _parse_vec3("a,b,c", "--deskew-angular-velocity")
+        assert False, "expected ValueError"
+    except ValueError as e:
+        assert "--deskew-angular-velocity" in str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +132,26 @@ def test_run_pipeline_custom_weights_applied():
         )
         geo_score = next(c["score"] for c in report["quality_score"]["categories"] if c["name"] == "geometry")
         assert abs(report["quality_score"]["overall_score"] - geo_score) < 1e-6
+
+
+def test_run_pipeline_raises_clear_error_on_camera_image_dimension_mismatch():
+    # A camera config's declared width/height that doesn't match the
+    # actual loaded image (typo'd config, or an image_dir with mixed
+    # resolutions) used to surface as a downstream IndexError from deep
+    # inside a visualization function. run_pipeline should now catch this
+    # itself, right after loading the headline frame's image, with a
+    # message that names both the declared and actual dimensions.
+    dataset = _build_demo_dataset("good", num_frames=5)
+    dataset.camera.width = 9999
+    dataset.camera.height = 9999
+    with tempfile.TemporaryDirectory() as tmpdir:
+        try:
+            run_pipeline(dataset, tmpdir, n_blocks=1, min_frames_per_block=1, min_frames_m4=1)
+            assert False, "expected ValueError"
+        except ValueError as e:
+            assert "9999" in str(e)
+        except IndexError:
+            assert False, "should raise a clear ValueError, not a bare IndexError"
 
 
 def test_run_pipeline_raises_on_empty_dataset():
@@ -253,6 +309,295 @@ def test_main_demo_good_with_fail_on_partial_returns_zero():
 def test_main_missing_config_returns_one():
     code = main(["--config", "/definitely/does/not/exist.yaml", "--output-dir", "/tmp/x"])
     assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# --validate-config
+# ---------------------------------------------------------------------------
+
+def _write_minimal_valid_config(tmpdir) -> str:
+    path = os.path.join(tmpdir, "config.yaml")
+    cfg = {
+        "camera": {
+            "image_dir": os.path.join(tmpdir, "images"), "width": 64, "height": 48, "model": "pinhole",
+            "intrinsics": {"fx": 500, "fy": 500, "cx": 32, "cy": 24},
+        },
+        "lidar": {"pcd_dir": os.path.join(tmpdir, "pcds"), "sensor_spec": {"horizontal_resolution_deg": 0.2}},
+        "extrinsic": {"parent": "lidar", "child": "camera", "translation": [0, 0, 0],
+                      "rotation": [0, 0, 0], "rotation_format": "rpy_deg"},
+    }
+    with open(path, "w") as f:
+        yaml.safe_dump(cfg, f)
+    return path
+
+
+def test_validate_config_only_passes_for_valid_schema_without_touching_data_files():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = _write_minimal_valid_config(tmpdir)
+        # image_dir/pcd_dir referenced in the config are never created on
+        # disk -- validate_config_only should still succeed, since it only
+        # checks YAML structure, not that the data actually exists.
+        validate_config_only(config_path)  # should not raise
+
+
+def test_validate_config_only_raises_config_schema_error_for_missing_keys():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "config.yaml")
+        with open(path, "w") as f:
+            yaml.safe_dump({"camera": {"width": 64, "height": 48}}, f)
+        try:
+            validate_config_only(path)
+            assert False, "expected ConfigSchemaError"
+        except ConfigSchemaError:
+            pass
+
+
+def test_main_validate_config_flag_returns_zero_for_valid_config():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = _write_minimal_valid_config(tmpdir)
+        code = main(["--config", config_path, "--validate-config"])
+        assert code == 0
+
+
+def test_main_validate_config_flag_returns_one_for_invalid_config():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "config.yaml")
+        with open(path, "w") as f:
+            yaml.safe_dump({"camera": {"width": 64}}, f)
+        code = main(["--config", path, "--validate-config"])
+        assert code == 1
+
+
+def test_main_validate_config_with_demo_returns_one():
+    code = main(["--demo", "--validate-config"])
+    assert code == 1
+
+
+# ---------------------------------------------------------------------------
+# --compare-to / --fail-on-regression / --format github-comment
+# ---------------------------------------------------------------------------
+
+def test_main_compare_to_prints_diff_and_returns_zero_when_improved():
+    with tempfile.TemporaryDirectory() as tmpdir1, tempfile.TemporaryDirectory() as tmpdir2:
+        assert main(["--demo", "--scenario", "drift", "--demo-frames", "20", "--output-dir", tmpdir1,
+                      "--no-visuals", "--edge-radius-px", "8.0"]) in (0, 2, 3)
+        code = main(["--demo", "--scenario", "good", "--demo-frames", "20", "--output-dir", tmpdir2,
+                      "--no-visuals", "--compare-to", os.path.join(tmpdir1, "report.json")])
+        assert code == 0
+
+
+def test_main_fail_on_regression_without_compare_to_returns_one():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = main(["--demo", "--demo-frames", "20", "--output-dir", tmpdir,
+                      "--no-visuals", "--fail-on-regression"])
+        assert code == 1
+
+
+def test_main_fail_on_regression_exits_four_on_regression():
+    with tempfile.TemporaryDirectory() as tmpdir1, tempfile.TemporaryDirectory() as tmpdir2:
+        main(["--demo", "--scenario", "good", "--demo-frames", "20", "--output-dir", tmpdir1, "--no-visuals"])
+        code = main(["--demo", "--scenario", "drift", "--demo-frames", "20", "--output-dir", tmpdir2,
+                      "--no-visuals", "--compare-to", os.path.join(tmpdir1, "report.json"),
+                      "--fail-on-regression"])
+        assert code == 4
+
+
+def test_main_format_github_comment_prints_markdown():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = main(["--demo", "--demo-frames", "20", "--output-dir", tmpdir,
+                         "--no-visuals", "--format", "github-comment"])
+        assert code == 0
+        out = buf.getvalue()
+        assert "Cam-LiDAR Calibration Quality" in out
+        assert "| Category | Score | Status |" in out
+
+
+# ---------------------------------------------------------------------------
+# --sequence-gif / --interactive-max-points
+# ---------------------------------------------------------------------------
+
+def test_run_pipeline_sequence_gif_adds_visual_when_requested():
+    dataset = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        report = run_pipeline(dataset, tmpdir, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+                               depth_jump_threshold_m=1.0, sequence_gif=True, sequence_max_frames=5)
+        assert report is not None
+        html = open(os.path.join(tmpdir, "report.html"), encoding="utf-8").read()
+        assert "data:image/gif;base64," in html
+
+
+def test_run_pipeline_no_sequence_gif_by_default():
+    dataset = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        run_pipeline(dataset, tmpdir, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+                     depth_jump_threshold_m=1.0)
+        html = open(os.path.join(tmpdir, "report.html"), encoding="utf-8").read()
+        assert "data:image/gif;base64," not in html
+
+
+# ---------------------------------------------------------------------------
+# STEP5 -- motion deskew (opt-in via --deskew-* flags / run_pipeline kwargs)
+# ---------------------------------------------------------------------------
+
+def test_run_pipeline_deskew_omitted_by_default():
+    dataset = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        report = run_pipeline(dataset, tmpdir, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+                               depth_jump_threshold_m=1.0)
+        assert report["motion_deskew"] is None
+        html = open(os.path.join(tmpdir, "report.html"), encoding="utf-8").read()
+        assert "Motion Deskew" not in html
+
+
+def test_run_pipeline_deskew_linear_velocity_adds_report_section_and_visual():
+    dataset = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        report = run_pipeline(
+            dataset, tmpdir, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+            depth_jump_threshold_m=1.0,
+            deskew_linear_velocity_mps=np.array([5.0, 0.0, 0.0]),
+        )
+        assert report["motion_deskew"] is not None
+        assert report["motion_deskew"]["max_correction_m"] > 0.0
+        html = open(os.path.join(tmpdir, "report.html"), encoding="utf-8").read()
+        assert "Motion Deskew" in html
+        assert "data:image/png;base64," in html
+
+
+def test_run_pipeline_deskew_angular_velocity_alone_also_triggers_section():
+    """Giving ONLY angular velocity (no linear) should still activate
+    deskew -- the missing vector defaults to zero, not 'skip deskew'."""
+    dataset = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        report = run_pipeline(
+            dataset, tmpdir, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+            depth_jump_threshold_m=1.0,
+            deskew_angular_velocity_rps=np.array([0.0, 0.0, 1.0]),
+        )
+        assert report["motion_deskew"] is not None
+
+
+def test_run_pipeline_deskew_zero_velocity_gives_zero_correction():
+    """Explicit zero velocity still activates the section (since the flag
+    was given), but the correction is exactly zero -- distinct from the
+    'omitted entirely' case above."""
+    dataset = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        report = run_pipeline(
+            dataset, tmpdir, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+            depth_jump_threshold_m=1.0,
+            deskew_linear_velocity_mps=np.zeros(3), deskew_angular_velocity_rps=np.zeros(3),
+        )
+        assert report["motion_deskew"] is not None
+        assert report["motion_deskew"]["max_correction_m"] == 0.0
+
+
+def test_run_pipeline_deskew_does_not_affect_quality_score():
+    """Deskewing is diagnostic-only -- M0/M2/M3/M4 must score identically
+    whether or not --deskew-* was given."""
+    dataset_a = _build_demo_dataset("good", num_frames=20)
+    dataset_b = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir_a, tempfile.TemporaryDirectory() as tmpdir_b:
+        report_no_deskew = run_pipeline(dataset_a, tmpdir_a, n_blocks=4, min_frames_per_block=4,
+                                         min_frames_m4=20, depth_jump_threshold_m=1.0)
+        report_with_deskew = run_pipeline(
+            dataset_b, tmpdir_b, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+            depth_jump_threshold_m=1.0,
+            deskew_linear_velocity_mps=np.array([8.0, 2.0, 0.0]),
+            deskew_angular_velocity_rps=np.array([0.0, 0.0, 0.5]),
+        )
+        assert report_no_deskew["quality_score"] == report_with_deskew["quality_score"]
+        assert report_no_deskew["m2_edge_alignment"] == report_with_deskew["m2_edge_alignment"]
+
+
+def test_run_pipeline_deskew_no_visuals_omits_image_but_keeps_report_section():
+    dataset = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        report = run_pipeline(
+            dataset, tmpdir, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+            depth_jump_threshold_m=1.0, no_visuals=True,
+            deskew_linear_velocity_mps=np.array([3.0, 0.0, 0.0]),
+        )
+        assert report["motion_deskew"] is not None  # numeric summary still computed
+
+
+def test_main_demo_with_deskew_flags_end_to_end():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = main([
+            "--demo", "--demo-frames", "20", "--output-dir", tmpdir,
+            "--deskew-linear-velocity", "5.0,0.0,0.0",
+            "--deskew-angular-velocity", "0.0,0.0,0.3",
+            "--deskew-scan-period-s", "0.1",
+        ])
+        assert code == 0
+        html = open(os.path.join(tmpdir, "report.html"), encoding="utf-8").read()
+        assert "Motion Deskew" in html
+
+
+def test_main_demo_deskew_malformed_velocity_returns_clean_error():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        stderr_buf = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buf):
+            code = main([
+                "--demo", "--output-dir", tmpdir,
+                "--deskew-linear-velocity", "not,a,vector",
+            ])
+        assert code != 0
+        assert "--deskew-linear-velocity" in stderr_buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# STEP8 -- dynamic object filtering (opt-in via --dynamic-filter)
+# ---------------------------------------------------------------------------
+
+def test_main_demo_with_dynamic_filter_flag_end_to_end():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = main([
+            "--demo", "--demo-frames", "20", "--output-dir", tmpdir,
+            "--dynamic-filter", "--dynamic-filter-window", "3",
+        ])
+        assert code == 0
+        html = open(os.path.join(tmpdir, "report.html"), encoding="utf-8").read()
+        assert "Dynamic Object Filtering" in html
+
+
+def test_main_demo_without_dynamic_filter_flag_omits_section():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        code = main(["--demo", "--demo-frames", "20", "--output-dir", tmpdir])
+        assert code == 0
+        html = open(os.path.join(tmpdir, "report.html"), encoding="utf-8").read()
+        assert "Dynamic Object Filtering" not in html
+
+
+def test_run_pipeline_dynamic_filter_does_not_affect_quality_score():
+    """Like deskewing, dynamic filtering is diagnostic-only -- M0/M2/M3/M4
+    must score identically whether or not --dynamic-filter was given."""
+    dataset_a = _build_demo_dataset("good", num_frames=20)
+    dataset_b = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir_a, tempfile.TemporaryDirectory() as tmpdir_b:
+        report_off = run_pipeline(dataset_a, tmpdir_a, n_blocks=4, min_frames_per_block=4,
+                                   min_frames_m4=20, depth_jump_threshold_m=1.0)
+        report_on = run_pipeline(dataset_b, tmpdir_b, n_blocks=4, min_frames_per_block=4,
+                                  min_frames_m4=20, depth_jump_threshold_m=1.0,
+                                  dynamic_filter=True, dynamic_filter_window=3)
+        assert report_off["quality_score"] == report_on["quality_score"]
+        assert report_off["m2_edge_alignment"] == report_on["m2_edge_alignment"]
+        assert report_on["dynamic_filter"] is not None
+        assert report_off["dynamic_filter"] is None
+
+
+def test_run_pipeline_interactive_max_points_overrides_default():
+    dataset = _build_demo_dataset("good", num_frames=20)
+    with tempfile.TemporaryDirectory() as tmpdir1, tempfile.TemporaryDirectory() as tmpdir2:
+        run_pipeline(dataset, tmpdir1, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+                     depth_jump_threshold_m=1.0, interactive_max_points=5)
+        run_pipeline(dataset, tmpdir2, n_blocks=4, min_frames_per_block=4, min_frames_m4=20,
+                     depth_jump_threshold_m=1.0, interactive_max_points=5000)
+        size_small = os.path.getsize(os.path.join(tmpdir1, "report.html"))
+        size_large = os.path.getsize(os.path.join(tmpdir2, "report.html"))
+        assert size_small < size_large
 
 
 # ---------------------------------------------------------------------------

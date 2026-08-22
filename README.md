@@ -69,6 +69,38 @@ cam-lidar-eval --demo --scenario drift --output-dir out/
 
 (pip로 설치하지 않았다면 `python -m app.cli ...`로 실행하세요.)
 
+콘솔 출력 예시(STEP1 Input Validation, STEP2 Synchronization이 calibration
+metric들보다 먼저 표시됩니다):
+
+```
+------------------------------------------------------
+ Cam-LiDAR Calibration Quality
+------------------------------------------------------
+ Synchronization
+   Matched frames        : 982 / 1000
+   Mean Δt               : +17.4 ms
+   Offset std            : 2.1 ms
+   Drop ratio             : 1.8%
+   Status                 : GOOD
+------------------------------------------------------
+ M0 Sanity Gate          : PASS
+ Geometry (M2)           : 86.7 / 100     [GOOD]
+ Generalization (M3)     : 100.0 / 100    [GOOD]
+ Stability (M4)          : 100.0 / 100    [GOOD]
+------------------------------------------------------
+ OVERALL QUALITY         : 95.6 / 100     [GOOD]
+------------------------------------------------------
+```
+
+입력 자체가 깨진 경우("Calibration BAD"가 아니라 "INPUT INVALID"로
+표시되고, 파이프라인은 실행되지 않고 exit code 5로 종료됩니다):
+
+```
+error: INPUT INVALID:
+  - camera.timestamps_monotonic: Camera timestamps are not monotonic
+    (frames are out of time order, or contain duplicate timestamps).
+```
+
 실제 데이터 대상:
 
 ```bash
@@ -153,6 +185,147 @@ CI 게이트 용도로 HTML이 필요 없을 때 `--no-visuals`보다 더 가벼
 N` (M2의 대표값을 어느 프레임에서 가져올지 지정), `--version` (설치된
 버전 확인).
 
+STEP5 (Motion Deskew, opt-in — quality score에는 전혀 영향 없는 순수
+진단용): `--deskew-linear-velocity vx,vy,vz` / `--deskew-angular-velocity
+wx,wy,wz` (LiDAR body-frame, m/s / rad/s) 중 하나라도 주면 headline
+프레임에 대해 constant-velocity deskew를 실행하고 리포트에 "Motion
+Deskew" 섹션(전/후 BEV 오버레이 + correction 히스토그램)을 추가합니다.
+`--deskew-scan-period-s`(기본 0.1), `--deskew-reference-time-s`(기본:
+scan 중간 지점), `--deskew-clockwise`(azimuth 스윕 방향, per-point
+timestamp가 없을 때의 근사에만 영향)로 세부 조정 가능:
+
+```bash
+cam-lidar-eval --demo \
+  --deskew-linear-velocity 10.0,0.0,0.0 \
+  --deskew-angular-velocity 0.0,0.0,0.2 \
+  --output-dir out/
+```
+
+STEP6(M2 correspondence matching)과 STEP7(per-point noise/uncertainty
+model)은 별도 플래그 없이 **M2의 기본 동작 자체**입니다. 리포트의 M2
+섹션에 `Match rate (STEP6)`(orientation/strength/local consistency를
+모두 통과해서 실제로 매칭된 point 비율)와 `Mean normalized error`
+(actual error / 그 point의 depth에서 기대되는 sensor noise) 통계, 그리고
+depth별 오차를 floor(Z) 곡선과 함께 보여주는 산점도가 자동으로 추가되어
+있습니다. 기존 방식(단순 nearest-distance)이 필요하면
+`evaluate_edge_alignment(..., use_correspondence_matching=False)`로
+직접 호출하세요 (CLI 플래그로는 아직 노출되지 않음).
+
+STEP9(Depth / Spatial Analysis)도 별도 플래그 없이 **항상 계산**됩니다
+(STEP5/STEP8과 달리 추가 입력이 필요 없어서). 리포트에 M2 섹션 바로 다음
+"Depth / Spatial Analysis" 섹션이 추가되어, 단일 mean_px 대신 depth
+bin(0-10m/10-20m/20-30m/30-50m/50m+)별과 카메라 영역
+(LEFT/CENTER/RIGHT, TOP/CENTER/BOTTOM — 두 개의 독립적인 축)별
+mean/median/p95/std/valid·failure count를 보여주고, depth bin 평균이
+단조 증가/감소하는지 자동 판정한 문구도 함께 표시됩니다.
+
+STEP10(M3/M4 Robustness 개선)도 별도 플래그 없이 **M3/M4의 기본 동작
+자체**입니다. M3는 각 block에 depth/edge density/point count/FOV
+coverage를 함께 기록해서, block 하나가 유독 나쁘면 다른 block들과 scene
+특성을 비교해 "Long-range scenes" 같은 원인 후보를 자동으로 제시합니다
+(`diagnose_instability`). M4는 기존 "5×median" 대신 **MAD/IQR/Hampel
+기반 robust 통계를 기본값**으로 사용하고(`--outlier-method`는 아직 CLI
+플래그로 노출되지 않았고 `evaluate_multiframe_consistency(...,
+outlier_method="multiplier"|"hampel"|"iqr")`로 직접 호출 시 선택 가능),
+valid ratio/failure ratio/outlier ratio를 각각 분리해서 리포트합니다.
+
+STEP11(Calibration Sensitivity Analysis)은 기존 `--advanced`(Phase-5 진단)
+안에 포함되어 있습니다. `--advanced`를 주면 "Perturbation Sensitivity"
+섹션에 roll/pitch/yaw(±0.05~1.0°), tx/ty/tz(±1~20mm) 각 축을 스펙 그대로의
+간격으로 흔들어보고 M2 오차 변화를 측정해서, floor(Z) 상대 기준으로
+HIGH/MEDIUM/LOW sensitivity 랭킹을 막대그래프로 보여줍니다(local-minimum
+판정과는 별개로 항상 계산됨). Timestamp 축(±5~100ms)은 STEP5의
+`motion.deskew` 인프라를 재사용해서 계산하는데, 플랫폼 속도(선속도/각속도)를
+알아야만 의미가 있어서 `evaluate_perturbation_sensitivity(...,
+linear_velocity_mps=..., angular_velocity_rps=...)`를 직접 호출할 때만
+계산됩니다 (CLI 플래그로는 아직 노출 안 됨; 안 주면 timestamp 축은 생략되고
+리포트에 그 이유가 명시됩니다).
+
+STEP12(⭐ Root Cause Diagnosis Engine)는 별도 플래그 없이 **항상 계산**됩니다
+(STEP9와 마찬가지로 추가 입력이 필요 없어서 — 다만 STEP8/STEP11처럼 opt-in인
+데이터가 있으면 그것도 같이 활용합니다). Quality score 바로 아래에
+"⭐ Root Cause Diagnosis" 섹션이 추가되어, 지금까지의 모든 진단(sync/M2/
+M3/M4/depth·spatial analysis/dynamic ratio/sensitivity)을 rule 기반으로
+교차 검증해서 "Yaw misalignment — HIGH", "Dynamic object contamination —
+MEDIUM" 같은 순위가 매겨진 원인 후보 목록을 만듭니다. AI/ML은 전혀 쓰지
+않고 IF-THEN 규칙만 사용합니다(스펙의 명시적 권고). 근거가 충분하지 않으면
+confidence를 낮게 매기거나(예: 공간적 비대칭 없이 sensitivity만 HIGH인
+경우 "unconfirmed"로 LOW 처리) 아예 후보를 만들지 않습니다 — 확신 없는
+진단을 강요하지 않는 걸 우선했습니다. 후보가 하나도 없으면 섹션 자체가
+리포트에서 생략됩니다.
+
+STEP13(Quality/Confidence/Coverage 분리)도 별도 플래그 없이 **항상
+계산**됩니다. 기존 Overall Quality 점수 계산 로직은 전혀 안 건드리고,
+그 옆에 두 개의 새 0-100 점수를 추가합니다: **Confidence**(이번 측정
+"과정" 자체를 얼마나 믿을 수 있는가 — sync 품질, M2 match rate, M3 유효
+block 비율, M4 valid ratio, input validation 상태의 평균)와
+**Coverage**(센서의 depth/FOV 범위를 실제로 얼마나 커버했는가 — STEP9의
+depth bin 5개·카메라 영역 6개 중 몇 개에 데이터가 있었는지, STEP10 M3의
+평균 FOV coverage). 둘 다 기존 Quality와 같은 80/50 GOOD/WARNING/BAD
+경계선을 공유해서 세 숫자를 나란히 비교할 수 있습니다. 같은 Quality
+점수라도 Confidence/Coverage가 다르면 완전히 다른 의미라는 게 스펙의
+핵심 요지입니다 — 예를 들어 `--demo`를 그냥 돌리면 Quality는 GOOD인데
+Coverage는 BAD로 나오는데(단일 depth·좁은 화면 영역만 테스트했으므로),
+이건 실제로 발생하는 정직한 신호입니다. 각 카드의 "why?"를 펼치면 어떤
+구성 요소가 점수를 만들었는지 볼 수 있습니다.
+
+STEP14(Visualization / HTML Report)는 스펙이 요구하는 5가지 최소 구성
+(① Projection Overlay ② Error Heatmap ③ Depth Error ④ Parameter
+Sensitivity ⑤ Diagnosis)이 이미 STEP3·STEP7/9·STEP11·STEP12에서 각각
+만들어져서 하나의 HTML 리포트에 전부 통합되어 있습니다. 이번 단계에서
+새로 채운 갭은 ⑤ Diagnosis 패널 하나입니다 — 스펙의 예시(`🔴 Yaw
+misalignment / 🟠 Tx misalignment / 🟢 Timestamp OK / 🟢 Sensor quality
+OK`)는 문제와 확인된 정상 항목을 **같은 목록에 섞어서** 보여주는데,
+STEP12 시점의 구현은 문제만 보고하고 있었습니다. 이제 sync GOOD,
+dynamic contamination 무시할 만함, M3 block-to-block 일관성 GOOD,
+모든 축 sensitivity LOW 같은 확인 사항도 🟢 OK로 같은 "Root Cause
+Diagnosis" 테이블에 함께 표시됩니다 — 문제도 확인 사항도 하나도 없을
+때만 섹션 자체가 생략됩니다.
+
+STEP15(Benchmark / Regression Test, 로드맵의 마지막 단계)는 새 프로덕션
+기능이 아니라 `evaluation/benchmark.py` + `tests/test_benchmark.py`로 구현된
+**벤치마크/회귀 테스트 스위트**입니다. 스펙의 두 가지 요구사항을 그대로
+구현했습니다:
+
+1. **Monotonicity 벤치마크**: 정답 T_CL을 알고 있는 synthetic scene에서
+   `evaluation/perturbation.py`의 `_perturb_rotation`/`_perturb_translation`/
+   `_perturb_timestamp_points`(STEP11)를 재사용해서, roll/pitch/yaw
+   (스펙 예시 그대로 0°→0.1°→0.2°→0.5°) + tx/ty/tz + timestamp(0/10/20/50/100ms)
+   전부에 대해 M2 오차가 정말로 단조 증가하는지 확인합니다. **실제로 검증하면서
+   발견한 사실**: 하나의 장면이 모든 축을 잘 보여주지 못합니다 — 단일 수직
+   경계선 장면은 roll에는 잘 맞지만 pitch/tx는 서브픽셀 이산화 잡음으로
+   비단조적이었고, 반대로 여러 개의 near/far 줄무늬가 있는 장면은 pitch/yaw/
+   tx/ty/tz에는 깨끗하게 단조 증가했지만 roll에서는 edge point 수 자체가
+   불안정해졌습니다. 이건 숨기지 않고 테스트에 그대로 문서화했습니다 — STEP11의
+   "축마다 민감도가 다르다"는 개념이 장면 기하학에도 그대로 적용된다는,
+   벤치마크가 아니었으면 몰랐을 정직한 발견입니다.
+2. **Known-cause → correct-diagnosis 벤치마크**: STEP12 자체 테스트는 가벼운
+   fake 객체로 룰 하나하나를 검증하지만, STEP15는 **mock을 전혀 쓰지 않고**
+   실제 STEP8 dynamic contamination 시나리오(진짜 `evaluate_edge_alignment`
+   + 진짜 `compare_with_without_dynamic_filtering`)와 실제 STEP2 sync
+   엔진(진짜 timestamp 어긋남이 있는 프레임 시퀀스 → 진짜 `classify_sync`)을
+   끝까지 돌려서 `diagnose_root_cause`의 1위 후보가 실제로
+   `DYNAMIC_CONTAMINATION`/`TEMPORAL_OFFSET`으로 나오는지 확인합니다 —
+   "알려진 문제 → 시스템 → 올바른 진단?"을 문자 그대로 구현한 것입니다.
+
+STEP8(Dynamic Object Filtering, opt-in — quality score에는 전혀 영향
+없는 순수 진단용): `--dynamic-filter`를 주면 headline 프레임 주변
+`--dynamic-filter-window`(기본 5)개 프레임에 걸쳐 multi-frame motion
+consistency로 각 (ring, azimuth) 셀을 STATIC/DYNAMIC/UNKNOWN으로
+분류하고, M2를 "overall"(필터 없음)과 "static only"(움직이는 물체로
+분류된 point 제외) 두 번 계산해서 비교합니다. **중요한 전제**: 이
+방법은 센서 플랫폼이 프레임 윈도우 동안 거의 정지해 있다는 가정에
+의존합니다 (움직이는 플랫폼에서는 정적 장면 전체가 "dynamic"처럼
+보여서 이 방법 자체가 무의미해집니다 — 진짜 ego-motion 보정이 없으면
+풀 수 없는 문제이고, 스펙 자체도 이걸 "나중에"로 미뤄둔 부분입니다).
+이미 자체 object detector/tracker 결과가 있다면
+`evaluation.dynamic_filter.apply_external_dynamic_mask()`로 직접 마스크를
+넣을 수 있습니다 (CLI 플래그로는 아직 노출되지 않음).
+
+```bash
+cam-lidar-eval --demo --dynamic-filter --output-dir out/
+```
+
 ---
 
 ## 4. 아키텍처
@@ -169,20 +342,88 @@ N` (M2의 대표값을 어느 프레임에서 가져올지 지정), `--version` 
                     │
                     ▼
       ┌──────────────────────────┐
+      │ Input Validation (STEP1) │   input/validation.py
+      │ INPUT_VALID/WARNING/     │   Calibration 평가 전에 raw 입력
+      │ INVALID 게이트           │   자체(NaN/Inf, timestamp 순서,
+      └──────────────┬───────────┘   빈 PCD, 잘못된 K 등)를 걺
+                      ▼
+      ┌──────────────────────────┐
+      │ Timestamp Sync (STEP2)   │   input/dataset.py
+      │ candidate window +       │   단순 nearest-neighbor 대신
+      │ monotonic matching +     │   후보 윈도우 + 단조 매칭 +
+      │ offset 추정              │   Δt(camera-lidar clock) 추정/보정
+      └──────────────┬───────────┘
+                      ▼
+      ┌──────────────────────────┐
+      │ Projection 검증 (STEP3)  │   geometry/projection.py (unit test)
+      │ 좌표변환 unit test +      │   visualization/projection_overlay.py
+      │ depth-colored overlay    │   M2 없이도 "투영이 말이 되는가"를
+      └──────────────┬───────────┘   먼저 눈으로 확인
+                      ▼
+      ┌──────────────────────────┐
+      │ LiDAR Ring/Topology      │   geometry/range_image.py
+      │ (STEP4)                 │   ring×azimuth range image +
+      │ 구조 기반 native edge    │   LiDAR-native depth-discontinuity
+      └──────────────┬───────────┘   추출 (image-projection 무관)
+                      ▼
+      ┌──────────────────────────┐
+      │ Motion Deskew (STEP5)    │   motion/deskew.py
+      │ constant-velocity 모델   │   visualization/deskew_comparison.py
+      │ (opt-in, 진단 전용)      │   --deskew-* 로 플랫폼 속도 입력 시만
+      └──────────────┬───────────┘   활성화, quality score엔 영향 없음
+                      ▼
+      ┌──────────────────────────┐
       │ M0 Sanity Gate           │   evaluation/sanity_gate.py
       │ (게이트, 점수 아님)       │
       └──────────────┬───────────┘
                       ▼
    ┌─────────────────────────────────────┐
-   │         Evaluation Engine           │
-   │  M2 Geometry │ M3 Generalization    │   evaluation/edge_alignment.py
-   │              │ M4 Stability         │   evaluation/holdout_consistency.py
-   └───────┬──────┴──────────┬───────────┘   evaluation/multiframe_consistency.py
-           ▼                 ▼
+   │         Evaluation Engine           │   evaluation/edge_alignment.py
+   │  M2 Geometry │ M3 Generalization    │   (M2 correspondence matching:
+   │              │ M4 Stability         │    STEP6 evaluation/edge_correspondence.py)
+   └───────┬──────┴──────────┬───────────┘   evaluation/holdout_consistency.py
+           ▼                 ▼                (STEP10: scene metadata + instability
+                                                diagnosis — "Long-range scenes" 등)
+                                                evaluation/multiframe_consistency.py
+                                                (STEP10: MAD/IQR/Hampel robust 통계,
+                                                valid/failure/outlier ratio 분리)
    quality/noise_floor.py → floor(Z), 센서 상대적 threshold
+                              (STEP7: compute_floor_array — point별 개별 depth에서
+                               noise floor 계산 → normalized_error = actual/expected,
+                               visualization/uncertainty_plot.py로 시각화)
    quality/normalization.py → 0-100 점수 곡선, floor(Z) 배수에 고정
    quality/quality_score.py → Geometry/Generalization/Stability → Overall Quality
                       │
+                      ▼
+      ┌──────────────────────────┐
+      │ Depth/Spatial Analysis   │   evaluation/spatial_analysis.py
+      │ (STEP9, 항상 계산됨)     │   visualization/spatial_analysis_plot.py
+      │ depth bin × 카메라 영역  │   단순 평균 대신 depth bin별/
+      └──────────────┬───────────┘   LEFT·CENTER·RIGHT·TOP·BOTTOM별 breakdown
+                      ▼
+      ┌──────────────────────────┐
+      │ Dynamic Filtering (STEP8)│   evaluation/dynamic_filter.py
+      │ multi-frame motion       │   visualization/dynamic_filter_overlay.py
+      │ consistency (opt-in)     │   --dynamic-filter 로 M2 overall vs
+      └──────────────┬───────────┘   static-only 비교, quality score엔 영향 없음
+                      ▼
+      ┌──────────────────────────┐
+      │ ⭐ Root Cause Diagnosis   │   evaluation/root_cause.py
+      │ Engine (STEP12)          │   sync/M2/M3/M4/spatial/dynamic/
+      │ rule 기반, 항상 계산됨   │   sensitivity를 모두 종합 → ranked
+      └──────────────┬───────────┘   HIGH/MEDIUM/LOW 원인 후보 (quality score엔 영향 없음)
+                      ▼
+      ┌──────────────────────────┐
+      │ Quality/Confidence/      │   quality/confidence_coverage.py
+      │ Coverage 분리 (STEP13)   │   같은 Quality 점수라도 측정 신뢰도
+      │ 항상 계산됨              │   (Confidence)·범위(Coverage)에 따라
+      └──────────────┬───────────┘   완전히 다른 의미일 수 있음을 분리해서 표시
+                      ▼
+      ┌──────────────────────────┐
+      │ Benchmark / Regression   │   evaluation/benchmark.py
+      │ Test (STEP15)            │   6축(roll/pitch/yaw/tx/ty/tz) + timestamp
+      │ tests/test_benchmark.py  │   monotonicity 검증, known-cause →
+      └──────────────┬───────────┘   correct-diagnosis end-to-end 벤치마크
                       ▼
         visualization/  (overlay, trajectory, histogram — PNG로 임베드)
                       │
@@ -195,6 +436,8 @@ N` (M2의 대표값을 어느 프레임에서 가져올지 지정), `--version` 
    (선택 사항, --advanced)
    evaluation/plane_consistency.py   — 지배적 평면의 경계 정합성
    evaluation/perturbation.py        — T_CL이 local minimum 근처에 있는가?
+                                        (STEP11: roll/pitch/yaw/tx/ty/tz/timestamp
+                                         축별 HIGH/MEDIUM/LOW sensitivity 랭킹)
    evaluation/temporal_drift.py      — 시퀀스에 걸쳐 에러가 추세를 보이는가?
 ```
 
@@ -206,45 +449,87 @@ cam_lidar_eval/
 │   ├── camera.py               CameraModel, image_dir 로더
 │   ├── lidar.py                LidarModel, PCD/PLY 로더 (직접 구현한 파서)
 │   ├── extrinsic.py            T_CL/T_LC 정규화 + sanity check (회전 유효성, 단위)
-│   └── dataset.py              Camera↔LiDAR 타임스탬프 동기화, M3용 time_blocks()
+│   ├── dataset.py              STEP2 — Timestamp Sync: 후보 윈도우 + 단조 매칭 + Δt 오프셋
+│   │                              추정/보정, M3용 time_blocks()
+│   └── validation.py           STEP1 — Input Validation: INPUT_VALID/WARNING/INVALID 게이트
 │
 ├── geometry/                  순수 수학, I/O 없음
 │   ├── transform.py             SE(3): rpy/quaternion→matrix, 합성, 역변환, transform_points
-│   └── projection.py            Pinhole/fisheye 투영, LiDAR→이미지 투영 파이프라인
+│   ├── projection.py            Pinhole/fisheye 투영, LiDAR→이미지 투영 파이프라인
+│   └── range_image.py           STEP4 — ring×azimuth range image, LiDAR-native depth-discontinuity 추출
+│
+├── motion/                     STEP5 — LiDAR Motion Deskew (opt-in, 진단 전용)
+│   └── deskew.py                 constant-velocity 모델로 per-point 프레임 내 시간 보정,
+│                                  정지/이동 전후 비교 (compare_before_after)
 │
 ├── evaluation/                 실제 metric들
 │   ├── sanity_gate.py           M0 — pass/fail 게이트, 점수화 안 됨
-│   ├── edge_alignment.py        M2 — LiDAR edge point vs 이미지 edge (distance transform)
-│   ├── holdout_consistency.py   M3 — 연속 시간 블록에 걸친 동일 T 평가
-│   ├── multiframe_consistency.py M4 — 프레임별 에러 안정성, outlier 검출
+│   ├── edge_alignment.py        M2 — LiDAR edge point vs 이미지 edge, STEP7 per-point uncertainty
+│   ├── edge_correspondence.py   STEP6 — M2 correspondence matching: candidate search + orientation
+│   │                              + gradient strength + local consistency (기존 nearest-distance 대체)
+│   ├── holdout_consistency.py   M3 — 연속 시간 블록에 걸친 동일 T 평가. STEP10: block별 scene
+│   │                              metadata(depth/edge density/point count/FOV coverage) 기록,
+│   │                              instability 원인 자동 진단 (diagnose_instability)
+│   ├── multiframe_consistency.py M4 — 프레임별 에러 안정성, outlier 검출. STEP10: MAD/IQR/
+│   │                              Hampel 기반 robust 통계 (기본값), valid/failure/outlier
+│   │                              ratio 분리, per-frame robust z-score
+│   ├── spatial_analysis.py      STEP9 — depth bin(0-10/10-20/20-30/30-50/50m+) × 카메라 영역
+│   │                              (LEFT/CENTER/RIGHT, TOP/CENTER/BOTTOM)별 mean/median/p95/std/
+│   │                              valid·failure count, depth trend 자동 판정 (항상 계산됨)
+│   ├── dynamic_filter.py        STEP8 — multi-frame motion consistency로 STATIC/DYNAMIC/UNKNOWN
+│   │                              분류, M2 overall vs static-only 비교 (opt-in, --dynamic-filter)
+│   ├── root_cause.py            STEP12 ⭐ — sync/M2/M3/M4/spatial/dynamic/sensitivity를 rule 기반으로
+│   │                              종합해서 ranked HIGH/MEDIUM/LOW 원인 후보 생성 (AI 없음, 항상 계산됨).
+│   │                              STEP14: 🟢 confirmation(OK) — 확인된 정상 항목도 같은 목록에 표시
+│   ├── benchmark.py             STEP15 — monotonicity(6축+timestamp) + known-cause→correct-diagnosis
+│   │                              벤치마크. tests/test_benchmark.py가 실제 벤치마크 스위트
 │   ├── plane_consistency.py     [advanced] 지배적 평면 경계 정합성
-│   ├── perturbation.py          [advanced] T_CL을 살짝 흔들어 local minimum 여부 확인
+│   ├── perturbation.py          [advanced] T_CL을 살짝 흔들어 local minimum 여부 확인.
+│   │                              STEP11: 스펙 그대로의 delta grid(rotation ±0.05~1.0°,
+│   │                              translation ±1~20mm, timestamp ±5~100ms — STEP5 motion.deskew
+│   │                              재사용, 플랫폼 속도 필요), 축별 HIGH/MEDIUM/LOW sensitivity 랭킹
 │   └── temporal_drift.py        [advanced] M4 프레임별 시퀀스에 대한 선형 추세 검정
 │
 ├── quality/                    px 측정값을 판단으로 변환
 │   ├── noise_floor.py           floor(Z): 센서 상대적 "이론상 최선"의 px 불확실성
 │   ├── normalization.py         floor(Z)에 고정된 0-100 점수 곡선
-│   └── quality_score.py         Geometry/Generalization/Stability → Overall Quality
+│   ├── quality_score.py         Geometry/Generalization/Stability → Overall Quality
+│   └── confidence_coverage.py   STEP13 — Quality와 별개로 Confidence(측정 신뢰도)·
+│                                  Coverage(depth/FOV 범위) 0-100 점수 분리 (항상 계산됨)
 │
-├── visualization/               HTML 리포트용 PNG 생성
-│   ├── overlay.py                투영된 LiDAR 점을 이미지 위에 GOOD/WARNING/BAD 색상으로 표시
+├── visualization/               HTML 리포트용 PNG / 인터랙티브 3D 씬 생성
+│   ├── overlay.py                투영된 LiDAR edge point를 이미지 위에 GOOD/WARNING/BAD 색상으로 표시
+│   ├── projection_overlay.py     STEP3 — M2 없이도 되는 raw 투영 sanity-check (depth colormap)
+│   ├── range_image.py            STEP4 — range image 렌더링 + LiDAR-native edge 하이라이트
+│   ├── deskew_comparison.py      STEP5 — deskew 전/후 BEV 오버레이 + correction 히스토그램
+│   ├── uncertainty_plot.py       STEP7 — depth vs error 산점도 + floor(Z) 곡선/GOOD·WARNING·BAD 밴드
+│   ├── dynamic_filter_overlay.py STEP8 — static(초록)/dynamic(빨강)/unknown(회색) 분류 오버레이
+│   ├── spatial_analysis_plot.py  STEP9 — depth bin/수평/수직 3-패널 막대그래프 (mean±std, P95, n/failed)
+│   ├── sensitivity_plot.py       STEP11 — 축별 sensitivity 수평 막대그래프 (HIGH/MEDIUM/LOW)
+│   ├── error_heatmap.py          이미지를 그리드로 나눠 셀별 평균 오차를 반투명 GOOD/WARNING/BAD 색으로 오버레이
+│   ├── colorized_pointcloud.py   LiDAR 포인트를 카메라 픽셀 색으로 칠한 컬러라이즈드 포인트클라우드 (3D + BEV)
+│   ├── camera_frustum.py         라이다 좌표계에 카메라 위치·frustum을 그린 rig 배치 개략도
+│   ├── bev_dual_panel.py         카메라 이미지 + bird's-eye view를 나란히, 같은 edge point를 색까지 맞춰 강조
+│   ├── interactive_viewer.py     컬러라이즈드 포인트클라우드 + frustum을 회전 가능한 Plotly 3D 씬으로 결합
 │   ├── trajectory.py             M4 프레임별 에러 라인 차트 (matplotlib)
 │   └── histogram.py              M2 per-point 에러 분포 (matplotlib)
 │
 ├── report/                     JSON + HTML 리포트 생성
 │   ├── builder.py                모든 결과를 하나의 plain-dict 리포트 구조로 조립
 │   ├── json.py                   NaN-safe한 엄격한 JSON 직렬화
-│   └── html.py                   단일 파일로 완결되는 다크 테마 HTML 리포트 (base64 이미지 임베드)
+│   ├── html.py                   단일 파일로 완결되는 다크 테마 HTML 리포트 (base64 이미지 임베드,
+│   │                              인터랙티브 3D 뷰어가 있을 때만 vendored plotly.js 인라인 포함)
+│   └── vendor/                   plotly.js gl3d 파셜 번들 (MIT, CDN 대신 오프라인 임베드용으로 vendoring)
 │
 ├── app/
 │   └── cli.py                   진입점: config/demo → pipeline → report → 콘솔 요약
 │
-├── tests/                      20개 파일에 걸친 276개 테스트 (§7 참고)
+├── tests/                      44개 파일에 걸친 테스트 (§7 참고)
 │
 ├── pyproject.toml               패키지 메타데이터, 의존성, `cam-lidar-eval` 콘솔 스크립트
 ├── requirements.txt             `pip install -e .`의 순수 pip 대안
 ├── run_tests.sh                 전체 테스트 스위트 실행, CI 친화적 exit code
-├── .github/workflows/ci.yaml     GitHub Actions: lint(ruff) + Python 3.10-3.13 install/test/smoke test
+├── .github/workflows/ci.yaml     GitHub Actions: lint(ruff) + Python 3.10-3.12 install/test/smoke test
 └── LICENSE                      MIT
 ```
 
@@ -323,13 +608,52 @@ FAIL하고 M4만 100점이어도 Overall Quality는 "100.0 WARNING"이지
 
 - **`report.json`** — 기계가 읽을 수 있는, 엄격하게 유효한 JSON
   (NaN/Inf는 `null`로 sanitize, `allow_nan=False`를 안전장치로 강제).
-  CI 파이프라인, 대시보드, 추가 툴링을 위한 용도.
-- **`report.html`** — 단일 파일로 완결되는 리포트 (이미지가 base64로
-  임베드되어 있어 다른 파일을 함께 가져갈 필요 없음). 다크 "계기판"
-  테마: overall-quality 게이지(순수 CSS `conic-gradient`, JS 없음),
-  GOOD/WARNING/BAD/FAIL 뱃지를 전체에 일관되게 사용, metric별 상세
-  테이블, 그리고 (`--no-visuals`가 아니라면) 실제 LiDAR-온-이미지
-  overlay, M4 에러 추이 차트, M2 에러 히스토그램까지 포함.
+  CI 파이프라인, 대시보드, 추가 툴링을 위한 용도. `input_validation`
+  (STEP1)과 `synchronization`(STEP2) 섹션이 최상단에 포함되어, calibration
+  metric들과 별개로 "입력 자체가 유효했는가"/"두 센서가 실제로 얼마나 잘
+  맞춰졌는가"를 확인할 수 있습니다.
+- **`report.html`** — 단일 파일로 완결되는 리포트 (이미지는 base64로,
+  인터랙티브 3D 씬이 있을 때만 plotly.js까지 인라인으로 임베드되어
+  있어 다른 파일을 함께 가져갈 필요가 없고 오프라인에서도 그대로
+  열립니다). 다크 "계기판" 테마: overall-quality 게이지(순수 CSS
+  `conic-gradient`), GOOD/WARNING/BAD/FAIL 뱃지를 전체에 일관되게
+  사용, metric별 상세 테이블. `--no-visuals`가 아니라면 아래
+  시각화까지 자동으로 포함됩니다:
+
+  | 시각화 | 보여주는 것 |
+  |---|---|
+  | LiDAR-온-이미지 overlay | 투영된 LiDAR edge point를 이미지 위에 GOOD/WARNING/BAD 색으로 표시 |
+  | 오차 히트맵 | 이미지를 그리드로 나눠 셀별 평균 오차를 반투명 색으로 오버레이 — 프레임의 어느 영역에서 오차가 집중되는지 |
+  | 컬러라이즈드 포인트클라우드 | LiDAR 포인트를 투영된 카메라 픽셀 색으로 칠한 3D + bird's-eye view — 경계에서 색이 번지면 정렬 오차 |
+  | 카메라 프러스텀 | 라이다 좌표계에 카메라 위치·시야각을 그린 rig 배치 개략도 — 리포트 상단 요약 |
+  | BEV 듀얼 패널 | 카메라 이미지와 bird's-eye view를 나란히, 같은 edge point를 색까지 맞춰 강조 — 거리/좌우별 오차 분포 확인 |
+  | 인터랙티브 3D 뷰어 | 컬러라이즈드 포인트클라우드 + 프러스텀을 회전/줌 가능한 Plotly 씬으로 결합 (Rig Geometry 섹션에서 정적 이미지와 토글) |
+  | M4 에러 추이 차트 | 프레임별 에러 추이, outlier 표시 |
+  | M2 에러 히스토그램 | per-point 에러 분포 |
+  | 시퀀스 오버레이 GIF (`--sequence-gif`, opt-in) | M2 overlay를 시퀀스 전체에서 샘플링한 프레임들로 이어붙인 애니메이션 — 정합 품질이 시간에 따라 유지되는지/드리프트하는지 |
+
+### CI 연동
+
+- **`--validate-config`**: 실제 데이터 로딩/평가 없이 `--config` YAML
+  스키마만 검사하고 종료 (exit 0/1). pre-commit hook이나 config 변경
+  PR에서 빠르게 쓰기 좋습니다.
+  ```bash
+  cam-lidar-eval --config path/to/config.yaml --validate-config
+  ```
+- **`--compare-to` / `--fail-on-regression`**: 이전 실행의 `report.json`과
+  비교해서 overall/카테고리별 점수·classification이 나빠졌는지 감지합니다.
+  ```bash
+  cam-lidar-eval --config config.yaml --output-dir out/ \
+    --compare-to previous_report.json --fail-on-regression   # 회귀 시 exit 4
+  ```
+- **`--format github-comment`**: GOOD/WARNING/BAD/FAIL 이모지 + 점수 표를
+  GitHub-flavored markdown으로 stdout에 출력합니다. `report.json`/
+  `report.html`은 평소대로 그대로 기록됩니다.
+  ```bash
+  cam-lidar-eval --config config.yaml --output-dir out/ \
+    --format github-comment > comment.md
+  gh pr comment "$PR_NUMBER" --body-file comment.md
+  ```
 
 ---
 
@@ -341,7 +665,7 @@ python3 tests/test_noise_floor.py         # 또는 개별 파일 직접 실행
 ```
 
 `run_tests.sh`는 뭔가 실패하면 exit code가 0이 아니게 되며,
-`.github/workflows/ci.yaml`이 매 push/PR마다 (Python 3.10-3.13) 실행하는
+`.github/workflows/ci.yaml`이 매 push/PR마다 (Python 3.10-3.12) 실행하는
 것과 정확히 동일한 스크립트입니다. CI는 이와 별개로 `ruff check .`를
 돌리는 `lint` job도 하나 더 실행합니다(pyflakes 동급 규칙만 켜져
 있음 — `dev` extras의 `ruff`로 로컬에서도 동일하게 돌릴 수 있습니다:
@@ -352,30 +676,54 @@ pytest 의존성 불필요 — 모든 테스트 파일은 자체 러너
 출력하고 실패 시 exit code가 0이 아니게 됩니다. 따라서
 `python3 tests/test_X.py`는 단독으로도, CI에서도 그대로 동작합니다.
 
-**20개 파일에 걸친 276개 테스트**, 전부 통과 (전체 실행 약 2~3분):
+**44개 파일에 걸친 709개 테스트**, 전부 통과 (전체 실행 약 3분):
 
 | 파일 | 테스트 수 | 커버리지 |
 |---|---|---|
 | `test_transform.py` | 18 | SE(3) 수학 |
-| `test_projection.py` | 13 | Pinhole/fisheye 투영 |
-| `test_camera.py` | 12 | Camera 로더 (rosbag 포함) |
+| `test_projection.py` | 23 | Pinhole/fisheye 투영, STEP3 distortion/rotation 단위 테스트 |
+| `test_projection_overlay.py` | 8 | STEP3 raw depth-colored 투영 sanity-check 오버레이 |
+| `test_range_image.py` | 19 | STEP4 range image, ring 유도, LiDAR-native depth-discontinuity 추출 |
+| `test_range_image_visualization.py` | 8 | STEP4 range image 렌더링, edge 하이라이트 |
+| `test_deskew.py` | 16 | STEP5 motion deskew — 독립 수치 시뮬레이션 기반 ground-truth 검증 포함 |
+| `test_deskew_comparison.py` | 7 | STEP5 deskew 전/후 BEV 오버레이 렌더링 |
+| `test_dynamic_filter.py` | 14 | STEP8 multi-frame motion consistency 분류, overall vs static-only 비교 — 스펙 예시 시나리오(contamination) 직접 재현 |
+| `test_root_cause.py` | 36 | STEP12 rule 기반 진단 — spec의 3개 예시 룰(temporal offset/yaw misalignment/dynamic contamination) 전부 직접 재현, 실제 다른 모듈 객체와의 통합 검증. STEP14: 🟢 confirmation(OK) 항목 — 문제뿐 아니라 확인된 정상 항목도 함께 보고 |
+| `test_benchmark.py` | 20 | STEP15 — 6축(roll/pitch/yaw/tx/ty/tz) + timestamp monotonicity 벤치마크(스펙의 "0.1<0.2<0.5" 예시 재현), dynamic contamination/temporal offset **완전 실제 파이프라인**(mock 없음) known-cause→correct-diagnosis 검증 |
+| `test_dynamic_filter_overlay.py` | 6 | STEP8 static/dynamic/unknown 오버레이 렌더링 |
+| `test_spatial_analysis.py` | 17 | STEP9 depth bin/카메라 영역별 breakdown — 스펙 워크드 예제(0.8→1.0→1.8→3.9px) 직접 재현 |
+| `test_spatial_analysis_plot.py` | 6 | STEP9 depth/수평/수직 3-패널 막대그래프 렌더링 |
+| `test_uncertainty_plot.py` | 7 | STEP7 depth vs error 산점도, floor(Z) 곡선/GOOD·WARNING·BAD 밴드 |
+| `test_camera.py` | 16 | Camera 로더 (rosbag 포함), `verify_image_shape` 해상도 검증 |
 | `test_lidar.py` | 19 | PCD/PLY 파서, LiDAR 로더 (rosbag 포함) |
 | `test_extrinsic.py` | 11 | 회전 포맷, T_CL/T_LC 방향 처리 |
-| `test_dataset.py` | 9 | 타임스탬프 동기화, time_blocks() |
-| `test_noise_floor.py` | 21 | floor(Z) 유도 및 fallback 규칙 |
+| `test_dataset.py` | 17 | STEP2 Timestamp Sync — 후보 윈도우, 단조 매칭, Δt 오프셋 추정/보정, GOOD/WARNING/BAD/FAIL 분류, time_blocks() |
+| `test_validation.py` | 28 | STEP1 Input Validation — camera/lidar/dataset 체크, INPUT_VALID/WARNING/INVALID 게이팅 |
+| `test_noise_floor.py` | 26 | floor(Z) 유도 및 fallback 규칙, STEP7 compute_floor_array (per-point) |
 | `test_normalization.py` | 21 | 점수 곡선, 500-sample property test 포함 |
-| `test_edge_alignment.py` | 15 | M2, 합성 depth-step 장면 포함 |
-| `test_holdout_consistency.py` | 8 | M3, drift 검출 시나리오 포함 |
-| `test_multiframe_consistency.py` | 9 | M4, outlier 검출 포함 |
+| `test_edge_alignment.py` | 22 | M2, 합성 depth-step 장면, STEP7 per-point uncertainty 필드, STEP8 dynamic_mask |
+| `test_edge_correspondence.py` | 21 | STEP6 M2 correspondence matching — candidate search/orientation/strength/local consistency, distractor 시나리오로 "가깝지만 틀린 edge 거부" 직접 검증 |
+| `test_holdout_consistency.py` | 15 | M3, drift 검출 시나리오, STEP10 scene metadata + diagnose_instability("Long-range scenes" 등) |
+| `test_multiframe_consistency.py` | 18 | M4, outlier 검출, STEP10 MAD/IQR/Hampel robust 통계, valid/failure/outlier ratio 분리 |
 | `test_sanity_gate.py` | 10 | M0, occlusion-violation 검출 포함 |
 | `test_plane_consistency.py` | 10 | 평면 피팅 + 경계 정합성 |
-| `test_perturbation.py` | 7 | Local-minimum 검출 |
+| `test_perturbation.py` | 20 | Local-minimum 검출, STEP11 delta grid/axis sensitivity/timestamp axis(motion.deskew 재사용) — 스펙 워크드 예제(Yaw/Tx HIGH 등) 시각 검증 |
+| `test_sensitivity_plot.py` | 6 | STEP11 축별 sensitivity 막대그래프 렌더링 |
 | `test_temporal_drift.py` | 9 | 추세 회귀, 유의성 게이팅 |
 | `test_quality_score.py` | 14 | 카테고리 집계, 가중치 처리, partial-result WARNING 캡 |
-| `test_report.py` | 20 | JSON/HTML 생성, NaN 안전성, visuals 임베딩 |
+| `test_confidence_coverage.py` | 16 | STEP13 Quality/Confidence/Coverage 분리 — 스펙의 두 대조 예시(같은 Quality, 다른 Confidence/Coverage) 정확히 재현 |
+| `test_report.py` | 48 | JSON/HTML 생성, NaN 안전성, visuals 임베딩, STEP1/2/3/4/5/7/8/9/10/11/12/13/14 HTML 섹션 표시 여부 |
+| `test_report_diff.py` | 7 | 리포트 diff, 회귀 판정 (classification/score 양쪽) |
+| `test_markdown.py` | 10 | GitHub 코멘트 markdown, 전 classification UTF-8 인코딩 |
 | `test_visualization.py` | 13 | Overlay/trajectory/histogram 렌더링 |
+| `test_error_heatmap.py` | 13 | 오차 히트맵 그리드 집계 + 렌더링 |
+| `test_colorized_pointcloud.py` | 10 | 컬러라이즈드 포인트클라우드, 해상도 불일치 오류, 깨진 3D 환경 대응 |
+| `test_camera_frustum.py` | 15 | Frustum 기하 계산, `auto_frustum_depth`, 깨진 3D 환경 대응 |
+| `test_bev_dual_panel.py` | 7 | BEV 듀얼 패널, edge point 재계산 정합성 |
+| `test_interactive_viewer.py` | 9 | Plotly 씬 JSON 직렬화, 해상도 불일치 오류 |
+| `test_sequence.py` | 7 | 시퀀스 GIF 프레임 샘플링 + 렌더링 |
 | `test_m0_report_integration.py` | 2 | M0 → report end-to-end |
-| `test_cli.py` | 35 | Demo 모드, config 로딩(rosbag 포함), 전체 파이프라인, exit code |
+| `test_cli.py` | 64 | Demo 모드, config 로딩(rosbag 포함), 전체 파이프라인, exit code, `--validate-config`/`--compare-to`/`--format`/`--sequence-gif`/STEP5 `--deskew-*`/STEP8 `--dynamic-filter` |
 
 모든 MVP metric(M2/M3/M4)은 **known, controllable한 ground truth를 가진
 합성 장면**(알려진 `T_CL` 아래에서 그려진 이미지 edge와 정확히 일치하도록
@@ -411,3 +759,9 @@ pytest 의존성 불필요 — 모든 테스트 파일은 자체 러너
   의도적으로 분리했습니다. (이건 한계가 아니라 의도된 설계입니다 —
   advanced metric이 quality_score에 영향을 주기 시작하면 검증 수준이
   다른 두 metric 집합이 섞여버립니다.)
+- **다중 카메라 / 다중 LiDAR rig는 지원하지 않습니다** — `input/`, `geometry/`,
+  `evaluation/`, `quality/`, `report/` 전 모듈이 "카메라 1대·LiDAR 1대"를
+  전제로 짜여 있습니다. 지원하려면 패치 수준이 아니라 각 모듈의 데이터
+  모델부터(현재 `EvaluationDataset`이 `camera: CameraModel` 단수 필드를
+  가정) 다시 설계해야 하는 수준이라, 별도 설계 논의 없이는 진행하지
+  않기로 했습니다.

@@ -157,36 +157,40 @@ def render_bev_dual_panel(
         context_points_cam = pts_cam
 
     fig, (ax_img, ax_bev) = plt.subplots(1, 2, figsize=(12.5, 5.2), dpi=dpi)
-    fig.patch.set_facecolor(_BG)
+    try:
+        fig.patch.set_facecolor(_BG)
 
-    ax_img.set_facecolor(_SURFACE)
-    ax_img.imshow(overlay_rgb)
-    ax_img.set_title("Camera view", color=_TEXT, fontsize=10)
-    ax_img.axis("off")
+        ax_img.set_facecolor(_SURFACE)
+        ax_img.imshow(overlay_rgb)
+        ax_img.set_title("Camera view", color=_TEXT, fontsize=10)
+        ax_img.axis("off")
 
-    ax_bev.set_facecolor(_SURFACE)
-    if context_points_cam is not None and context_points_cam.shape[0] > 0:
-        ax_bev.scatter(context_points_cam[:, 0], context_points_cam[:, 2], c=_CONTEXT_COLOR,
-                        s=1.0, alpha=0.5, marker=".", linewidths=0, label="LiDAR points")
-    ax_bev.scatter(edge_points_cam[:, 0], edge_points_cam[:, 2], c=point_colors,
-                    s=point_size, marker="o", linewidths=0, label="Edge points")
-    ax_bev.invert_yaxis()  # near depth at bottom, far depth toward the top
-    ax_bev.set_xlabel("X (m)", color=_TEXT, fontsize=8)
-    ax_bev.set_ylabel("Depth Z (m)", color=_TEXT, fontsize=8)
-    ax_bev.set_title("Bird's-eye view (same edge points, colored to match)", color=_TEXT, fontsize=10)
-    ax_bev.tick_params(colors=_TEXT, labelsize=7)
-    ax_bev.grid(color=_GRID, linewidth=0.5)
-    for spine in ax_bev.spines.values():
-        spine.set_color(_GRID)
-    ax_bev.set_aspect("equal", adjustable="datalim")
-    legend = ax_bev.legend(loc="upper right", fontsize=7, facecolor=_SURFACE, edgecolor=_GRID, labelcolor=_TEXT)
+        ax_bev.set_facecolor(_SURFACE)
+        if context_points_cam is not None and context_points_cam.shape[0] > 0:
+            ax_bev.scatter(context_points_cam[:, 0], context_points_cam[:, 2], c=_CONTEXT_COLOR,
+                            s=1.0, alpha=0.5, marker=".", linewidths=0, label="LiDAR points")
+        ax_bev.scatter(edge_points_cam[:, 0], edge_points_cam[:, 2], c=point_colors,
+                        s=point_size, marker="o", linewidths=0, label="Edge points")
+        ax_bev.invert_yaxis()  # near depth at bottom, far depth toward the top
+        ax_bev.set_xlabel("X (m)", color=_TEXT, fontsize=8)
+        ax_bev.set_ylabel("Depth Z (m)", color=_TEXT, fontsize=8)
+        ax_bev.set_title("Bird's-eye view (same edge points, colored to match)", color=_TEXT, fontsize=10)
+        ax_bev.tick_params(colors=_TEXT, labelsize=7)
+        ax_bev.grid(color=_GRID, linewidth=0.5)
+        for spine in ax_bev.spines.values():
+            spine.set_color(_GRID)
+        ax_bev.set_aspect("equal", adjustable="datalim")
+        ax_bev.legend(loc="upper right", fontsize=7, facecolor=_SURFACE, edgecolor=_GRID, labelcolor=_TEXT)
 
-    fig.tight_layout()
+        fig.tight_layout()
 
-    buf = BytesIO()
-    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
-    plt.close(fig)
-    return buf.getvalue()
+        buf = BytesIO()
+        fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+        return buf.getvalue()
+    finally:
+        # Always close, even if a plotting call above raises -- otherwise
+        # the figure leaks in matplotlib's global pyplot state.
+        plt.close(fig)
 
 
 def render_bev_dual_panel_from_result(

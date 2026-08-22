@@ -138,3 +138,113 @@ def test_render_error_heatmap_from_result_none_when_fail():
     image, result = _make_result()
     result.classification = "FAIL"
     assert render_error_heatmap_from_result(image, result) is None
+
+
+# ---------------------------------------------------------------------------
+# Vectorized compute_error_grid vs. a naive reference implementation
+# ---------------------------------------------------------------------------
+
+def _compute_error_grid_naive(image_height, image_width, edge_pixels, errors_px, floor_px,
+                               grid_rows, grid_cols, min_points_per_cell):
+    """Reference implementation matching the ORIGINAL (pre-vectorization)
+    compute_error_grid: a plain double loop over grid cells, re-masking
+    the full point array on every iteration. Kept only for the
+    equivalence test below -- compute_error_grid itself now uses
+    np.bincount instead."""
+    edge_pixels = np.asarray(edge_pixels, dtype=np.float64)
+    errors_px = np.asarray(errors_px, dtype=np.float64)
+    cell_h = image_height / grid_rows
+    cell_w = image_width / grid_cols
+    mean_grid = np.full((grid_rows, grid_cols), np.nan)
+    counts = np.zeros((grid_rows, grid_cols), dtype=int)
+    if edge_pixels.shape[0] > 0:
+        col_idx = np.clip((edge_pixels[:, 0] / cell_w).astype(int), 0, grid_cols - 1)
+        row_idx = np.clip((edge_pixels[:, 1] / cell_h).astype(int), 0, grid_rows - 1)
+        in_bounds = (
+            (edge_pixels[:, 0] >= 0) & (edge_pixels[:, 0] < image_width) &
+            (edge_pixels[:, 1] >= 0) & (edge_pixels[:, 1] < image_height)
+        )
+        for r in range(grid_rows):
+            for c in range(grid_cols):
+                mask = in_bounds & (row_idx == r) & (col_idx == c)
+                n = int(mask.sum())
+                counts[r, c] = n
+                if n >= min_points_per_cell:
+                    mean_grid[r, c] = float(errors_px[mask].mean())
+    return mean_grid, counts
+
+
+def test_compute_error_grid_matches_naive_reference_random():
+    # Randomized equivalence test (same discipline as the project's other
+    # performance rewrites -- see extract_lidar_edge_points): the
+    # vectorized np.bincount version must produce bit-for-bit-equivalent
+    # counts and means to the original nested-loop version across many
+    # random configurations, not just the hand-picked cases above.
+    rng = np.random.default_rng(0)
+    for trial in range(20):
+        h, w = int(rng.integers(50, 500)), int(rng.integers(50, 500))
+        grid_rows, grid_cols = int(rng.integers(2, 12)), int(rng.integers(2, 12))
+        n_points = int(rng.integers(0, 300))
+        min_points_per_cell = int(rng.integers(1, 5))
+
+        pixels = np.column_stack([
+            rng.uniform(-10, w + 10, n_points),  # include some out-of-bounds points
+            rng.uniform(-10, h + 10, n_points),
+        ])
+        errors = rng.uniform(0, 20, n_points)
+
+        grid = compute_error_grid(h, w, pixels, errors, floor_px=1.0,
+                                   grid_rows=grid_rows, grid_cols=grid_cols,
+                                   min_points_per_cell=min_points_per_cell)
+        naive_mean, naive_counts = _compute_error_grid_naive(
+            h, w, pixels, errors, floor_px=1.0,
+            grid_rows=grid_rows, grid_cols=grid_cols, min_points_per_cell=min_points_per_cell,
+        )
+
+        assert np.array_equal(grid.counts, naive_counts), f"trial {trial}: counts mismatch"
+        assert np.allclose(grid.mean_err_px, naive_mean, equal_nan=True, rtol=1e-9), \
+            f"trial {trial}: mean_err_px mismatch"
+
+
+def test_compute_error_grid_vectorized_is_faster_at_fine_grid_resolution():
+    # The whole point of the rewrite: a fine grid (e.g. 40x40) used to
+    # scale as O(rows*cols*N) with a Python-level double loop; confirm
+    # the vectorized version is now meaningfully faster on a large point
+    # set + fine grid, rather than just "not obviously slower".
+    import time
+    rng = np.random.default_rng(1)
+    n_points = 20_000
+    h, w = 1080, 1920
+    pixels = np.column_stack([rng.uniform(0, w, n_points), rng.uniform(0, h, n_points)])
+    errors = rng.uniform(0, 20, n_points)
+
+    t0 = time.perf_counter()
+    compute_error_grid(h, w, pixels, errors, floor_px=1.0, grid_rows=40, grid_cols=40, min_points_per_cell=1)
+    vectorized_time = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    _compute_error_grid_naive(h, w, pixels, errors, floor_px=1.0, grid_rows=40, grid_cols=40, min_points_per_cell=1)
+    naive_time = time.perf_counter() - t0
+
+    assert vectorized_time < naive_time * 0.5, (
+        f"expected the vectorized version to be meaningfully faster: "
+        f"vectorized={vectorized_time:.4f}s, naive={naive_time:.4f}s"
+    )
+
+
+if __name__ == "__main__":
+    test_fns = [obj for name, obj in list(globals().items()) if name.startswith("test_")]
+    passed, failed = 0, 0
+    for fn in test_fns:
+        try:
+            fn()
+            print(f"PASS  {fn.__name__}")
+            passed += 1
+        except AssertionError as e:
+            print(f"FAIL  {fn.__name__}: {e}")
+            failed += 1
+        except Exception as e:
+            print(f"ERROR {fn.__name__}: {type(e).__name__}: {e}")
+            failed += 1
+    print(f"\n{passed} passed, {failed} failed")
+    sys.exit(1 if failed else 0)
