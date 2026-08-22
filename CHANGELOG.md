@@ -5,6 +5,182 @@
 
 ## [Unreleased]
 
+### 업그레이드 (Upgraded)
+
+- **`--advanced` perturbation 진단 병렬화.** M2를 6DOF × 2방향 ×
+  delta 조합으로 재평가하는 24개(+baseline 1개) 샘플을 순차 실행
+  대신 `concurrent.futures.ThreadPoolExecutor`로 동시 실행하도록
+  `evaluation/perturbation.py`를 고쳤습니다. 각 M2 호출은 대부분의
+  시간을 numpy/OpenCV/SciPy C 확장(Canny, distance transform,
+  cKDTree) 안에서 보내는데, 이 구간에서 GIL이 풀리기 때문에 스레드로도
+  실질적인 속도 개선이 있습니다 — 이미지 배열을 24번 다시 피클링해야
+  하는 프로세스 풀 방식보다 가볍습니다. `executor.map`으로 수집해서
+  스레드 완료 순서와 무관하게 결과 순서가 항상 결정론적입니다(기존
+  순차 버전과 동일한 출력 보장). `max_workers`는 기본적으로
+  `os.cpu_count()`(샘플 수로 상한)를 씁니다. `time.sleep` mock으로
+  스레드 동시성을 직접 재현 검증한 결과 8 workers에서 순차 대비
+  **2.4배 단축**을 확인했습니다.
+
+- **`error_heatmap.py`의 `compute_error_grid` 벡터화.**
+  `grid_rows × grid_cols`만큼 Python 루프를 돌며 매번 전체 포인트
+  배열에 boolean mask를 씌우던 O(rows·cols·N) 코드를,
+  `evaluation.edge_alignment.extract_lidar_edge_points`에서 이미 쓴
+  벡터화 패턴(`np.bincount`)을 그대로 적용해 O(N)으로 줄였습니다.
+  20회 랜덤 설정에 걸친 동등성 테스트로 원본 나이브 구현과 결과가
+  완전히 일치하는지 검증했고, 40×40 그리드 + 2만 포인트 기준
+  **약 34배(0.0687s → 0.0018s) 개선**을 실측했습니다. 기본 그리드(6×8)에서는
+  체감 차이가 없지만 더 촘촘한 그리드를 요청해도 느려지지 않습니다.
+
+- **CI에 full-visuals 스모크 테스트 추가.** 기존 CI의 스모크 테스트는
+  항상 `--no-visuals`로만 돌아서, 5개 시각화 모듈 + 인터랙티브
+  뷰어 + `--advanced` 진단 3종이 실제로 파이프라인 끝까지 붙어서
+  도는지 CI에서 한 번도 검증된 적이 없었습니다. `.github/workflows/ci.yaml`에
+  `full-visuals-smoke` 잡을 신설해 `--advanced --sequence-gif`까지
+  전부 켠 상태로 1회(Python 버전 매트릭스와 별개로) 실행하고,
+  `report.html`/`report.json`에 각 시각화·진단이 실제로 들어갔는지
+  마커 문자열로 확인합니다. 로컬에서 실제로 이 체크를 돌리다가
+  아포스트로피가 포함된 마커 문자열이 `html.escape()`로 이스케이프된
+  텍스트와 매칭 안 되는 버그를 발견해서 바로 고쳤고, 일부러 섹션을
+  지워서 체크가 실제로 실패를 잡아내는지도 재현 확인했습니다.
+
+- **`_validate_config_schema`를 손으로 짠 if/isinstance 체크에서
+  `jsonschema` 기반 선언적 스키마로 교체.** 필수 키 목록, enum 값,
+  "source가 rosbag이 아니면 image_dir/pcd_dir 필수" 같은 조건부 로직이
+  ~80줄의 명령형 코드 대신 `_CONFIG_JSON_SCHEMA` 하나의 데이터
+  구조로 표현됩니다 — 새 필수 키나 enum 값 추가가 이제 한 줄짜리
+  스키마 수정으로 끝납니다. jsonschema의 `ValidationError`를 기존과
+  **동일한 문구**("missing top-level key 'camera'",
+  "'extrinsic.rotation_format' is 'rpy_degrees', must be one of (...)"
+  등)로 재구성하는 `_format_schema_error()`를 추가해서, 검증 엔진을
+  바꿨다는 사실이 `--config` 사용자에게는 전혀 드러나지 않습니다
+  (기존 8개 테스트의 정확한 에러 문구 assertion이 전부 그대로 통과).
+  `jsonschema>=4.0`을 `pyproject.toml`/`requirements.txt`에 core
+  dependency로 추가했습니다.
+
+### 추가 (Added)
+
+- **`--validate-config`**: `--config` YAML의 스키마만 빠르게 검사하고
+  종료하는 플래그. `app/cli.py`에 `validate_config_only()` 함수를
+  추가했습니다 — 실제 데이터 로딩(이미지/포인트클라우드 파일 접근)이나
+  평가는 전혀 하지 않고 YAML 구조(필수 키 존재, 타입, enum 값)만
+  확인합니다. 유효하면 `OK: ...` + exit 0, 문제가 있으면 전체 문제
+  목록 + exit 1. `--demo`와 함께 쓰면 명확한 에러로 거부됩니다.
+
+- **리포트 diff / CI 회귀 감지** (`report/diff.py`, `--compare-to`,
+  `--fail-on-regression`). 이전 실행의 `report.json`과 비교해서
+  overall + 카테고리별(geometry/generalization/stability) 점수·
+  classification 변화를 계산합니다.
+  - `compute_report_diff(old, new)`: classification이 나빠지거나
+    (예: GOOD→WARNING), 같은 classification이어도 점수가 떨어지면
+    `regressed: True`로 판정합니다. 카테고리가 한쪽에만 없는 경우
+    (새로 FAIL 시작/종료)도 안전하게 최악으로 처리해 놓치지 않습니다.
+  - `--compare-to PATH`로 이전 `report.json`을 지정하면 콘솔 출력에
+    "vs. previous run" 섹션이 추가됩니다.
+  - `--fail-on-regression`은 회귀가 감지되면 exit code `4`로
+    종료합니다(`--compare-to` 필수, 없으면 즉시 에러). CI 파이프라인에서
+    캘리브레이션이 이전 실행보다 나빠졌을 때 빌드를 실패시키는 용도.
+
+- **GitHub PR 코멘트용 markdown 출력** (`report/markdown.py`,
+  `--format github-comment`). GOOD/WARNING/BAD/FAIL 이모지 + 카테고리
+  점수 표(및 `--compare-to`가 있으면 Δ 컬럼까지)를 GitHub-flavored
+  markdown으로 stdout에 출력합니다 — `gh pr comment --body-file -` 등에
+  그대로 파이프하기 좋습니다. `report.json`/`report.html`은 이 플래그와
+  무관하게 평소대로 그대로 기록됩니다.
+
+- **시퀀스 오버레이 GIF** (`visualization/sequence.py`, `--sequence-gif`,
+  `--sequence-max-frames`). M2 overlay를 시퀀스 전체에서 균등 샘플링한
+  프레임들에 대해 반복 실행해 애니메이션 GIF로 이어붙입니다 — 대표
+  프레임 하나만 보여주던 기존 시각화들과 달리, 정합 품질이 시간에
+  따라 유지되는지 드리프트하는지 한눈에 볼 수 있습니다. 각 프레임에
+  `frame N | mean Xpx | STATUS` 라벨을 오버레이합니다. GIF 인코딩은
+  matplotlib의 기존 의존성인 Pillow를 그대로 재사용해 새 의존성을
+  추가하지 않았습니다. 프레임마다 M2 파이프라인 전체를 다시 돌리기
+  때문에 비교적 비용이 크므로 옵트인이며, 기본적으로 생성되지
+  않습니다. `report/html.py`의 `_img_tag`를 PNG 전용에서 MIME
+  타입 파라미터화(`image/png` 기본값)해서 GIF도 재사용할 수
+  있게 했습니다.
+
+- **`--interactive-max-points`**: 인터랙티브 3D 뷰어의 포인트 예산
+  (기본 6,000)을 CLI에서 직접 오버라이드할 수 있습니다.
+
+### 변경 (Changed)
+
+- **버전 관리 재정비.** `report/builder.py`의 `TOOL_VERSION`이
+  `"0.1.0-mvp"`로 고정된 채 `[Unreleased]`에 수십 개 기능이 쌓이는
+  동안 한 번도 올라가지 않던 문제를 고쳤습니다. 이번 릴리스부터
+  `pyproject.toml`의 `version`과 `TOOL_VERSION`을 동일한 값(`0.2.0`)으로
+  맞추고, `CHANGELOG.md`의 누적된 `[Unreleased]` 항목을
+  `[0.2.0]`으로 잘라냈습니다. `CONTRIBUTING.md`에 릴리스 체크리스트를
+  추가해 앞으로 이 두 값이 다시 어긋나지 않도록 했습니다.
+
+- **`visualization.interactive_viewer`가 `visualization.camera_frustum`의
+  private 함수를 가로질러 import하던 문제.** `_auto_depth`(라이다
+  포인트 깊이 분포로 frustum 깊이를 자동 산정하는 로직)를
+  `camera_frustum.py`의 public 함수 `auto_frustum_depth`로 승격했습니다.
+  두 모듈이 실제로 공유하는 로직인데 언더스코어가 붙은 내부 함수를
+  다른 모듈이 그대로 가져다 쓰는 건 모듈 경계를 무시하는 것이라
+  코드 스멜이었습니다. `tests/test_camera_frustum.py`에
+  `auto_frustum_depth`를 직접 검증하는 단위 테스트도 추가했습니다.
+
+## [0.2.0] — 2026-08-16
+
+### 수정 (Fixed)
+
+- **`CONTRIBUTING.md`가 명시한 lint CI job이 실제로는 존재하지 않던 문제.**
+  `CONTRIBUTING.md`는 "CI에도 동일한 명령으로 도는 별도 lint job이
+  있습니다"라고 안내하지만, 실제 `.github/workflows/ci.yaml`에는
+  `test` job만 있고 `ruff` lint job이 없었습니다. 그 결과 아래 3건이
+  아무도 모르게 방치되어 있었습니다:
+  - `tests/test_camera_frustum.py`: 미사용 import 2건
+    (`FrustumGeometry`, `_make_camera`) 제거
+  - `visualization/bev_dual_panel.py`: 사용하지 않는 지역 변수
+    `legend` 제거 (`ax_bev.legend(...)` 호출 자체는 그대로 두고,
+    반환값 캡처만 제거 -- 범례를 그리는 부수효과는 필요하므로)
+  - `.github/workflows/ci.yaml`에 `lint` job을 추가해
+    (`pip install -e ".[dev]"` &rarr; `ruff check .`) `CONTRIBUTING.md`의
+    설명과 실제 CI가 일치하도록 맞췄습니다. 격리된 venv에서 CI와
+    동일한 명령을 재현해 통과를 확인했습니다.
+
+- **이미지/카메라 해상도 불일치 시 `IndexError`로 크래시하던 문제.**
+  config의 camera `width`/`height`와 실제로 로드된 이미지 파일의
+  해상도가 다를 때, `visualization/colorized_pointcloud.py`(및 이를
+  내부에서 호출하는 `visualization/interactive_viewer.py`)가 픽셀
+  색상을 샘플링하는 과정에서 `IndexError`로 죽던 문제를 두 겹으로
+  고쳤습니다.
+  - **근본 원인 수정**: `input/camera.py`의 `CameraModel`에
+    `verify_image_shape(image)` 메서드를 추가하고,
+    `app/cli.py`의 `run_pipeline`이 대표(headline) 프레임 이미지를
+    로드한 직후 이를 호출하도록 연결했습니다. 불일치가 있으면
+    선언된 값과 실제 값을 모두 명시한 `ValueError`가 즉시 발생하고,
+    `main()`의 기존 예외 처리 경로를 통해 트레이스백 없이
+    `error: ...` 메시지 + exit code 1로 깔끔하게 출력됩니다.
+  - **방어적 수정**: `visualization/colorized_pointcloud.py`의
+    `colorize_lidar_points()` 자체에도 동일한 검증을 추가해서,
+    CLI를 거치지 않고 이 함수를 직접 호출하는 경우에도 원인 모를
+    `IndexError` 대신 명확한 `ValueError`를 받도록 했습니다.
+  - `overlay.py`/`error_heatmap.py`/`bev_dual_panel.py`는 `cv2.circle`/
+    `cv2.rectangle`을 사용해 원래도 범위 밖 좌표를 그냥 무시하고
+    넘어가므로(크래시하지 않으므로) 별도 수정이 필요 없었습니다.
+  - `tests/test_camera.py`, `tests/test_colorized_pointcloud.py`,
+    `tests/test_interactive_viewer.py`, `tests/test_cli.py`에 회귀
+    테스트 7개를 추가했습니다.
+
+- **`run_tests.sh`/CI가 신규 시각화 테스트 44개를 조용히 건너뛰던 문제.**
+  `tests/test_bev_dual_panel.py`, `test_camera_frustum.py`,
+  `test_colorized_pointcloud.py`, `test_error_heatmap.py`,
+  `test_interactive_viewer.py` 5개 파일에 다른 모든 테스트 파일이
+  갖고 있는 `if __name__ == "__main__":` 실행 블록이 빠져 있었습니다.
+  `run_tests.sh`(및 CI)는 pytest가 아니라 `python3 tests/test_X.py`를
+  직접 실행하는 방식이라, 이 블록이 없는 파일은 import만 되고 아무
+  것도 실행하지 않은 채 exit 0을 반환했습니다 -- CI 로그에 PASS/FAIL
+  이 전혀 안 찍히고 그냥 조용히 통과 처리되어, 해당 5개 모듈에
+  리그레션이 생겨도 CI가 감지하지 못하는 상태였습니다. 표준
+  런너 블록을 추가해 `run_tests.sh` 기준 총 테스트 수가
+  276개(추정) &rarr; 320개로 바로잡혔습니다(pytest로는 이전부터
+  정상적으로 320개가 통과하고 있었으므로, 테스트 자체의 정확성
+  문제는 아니었습니다 -- CI가 사용하는 실행 경로에서만 빠져
+  있었습니다).
+
 ### 변경 (Changed)
 
 - **Rig Geometry 섹션에 정적/인터랙티브 토글 추가, 인터랙티브 씬 용량

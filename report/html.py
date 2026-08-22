@@ -42,6 +42,12 @@ _STATUS_COLORS = {
     "WARNING": "#D29922",
     "BAD": "#F85149",
     "FAIL": "#6E7681",
+    # STEP11 -- Perturbation Sensitivity's HIGH/MEDIUM/LOW classification
+    # reuses the same badge rendering as GOOD/WARNING/BAD; HIGH sensitivity
+    # is the one worth worrying about, so it maps to the same red as BAD.
+    "HIGH": "#F85149",
+    "MEDIUM": "#D29922",
+    "LOW": "#3FB950",
 }
 
 _CSS = """
@@ -388,16 +394,17 @@ def _color_for(classification: str) -> str:
     return _STATUS_COLORS.get(classification, _STATUS_COLORS["FAIL"])
 
 
-def _img_tag(png_bytes: Optional[bytes], alt: str) -> str:
-    """Embed a PNG as a base64 data URI so the HTML report stays a single
-    self-contained file (no sibling image files to lose track of when
-    shared). Returns an empty string if png_bytes is None, so callers can
-    unconditionally splice this into a template without an if/else."""
-    if not png_bytes:
+def _img_tag(image_bytes: Optional[bytes], alt: str, mime: str = "image/png") -> str:
+    """Embed an image (PNG or GIF) as a base64 data URI so the HTML report
+    stays a single self-contained file (no sibling image files to lose
+    track of when shared). Returns an empty string if image_bytes is
+    None, so callers can unconditionally splice this into a template
+    without an if/else."""
+    if not image_bytes:
         return ""
-    b64 = base64.b64encode(png_bytes).decode("ascii")
+    b64 = base64.b64encode(image_bytes).decode("ascii")
     return (
-        f'<img src="data:image/png;base64,{b64}" alt="{escape(alt)}" '
+        f'<img src="data:{mime};base64,{b64}" alt="{escape(alt)}" '
         f'style="width:100%; border-radius:10px; margin-top:0.75rem; display:block;">'
     )
 
@@ -480,6 +487,253 @@ def _render_categories(quality: dict) -> str:
     return f'<div class="category-grid">{"".join(cards)}</div>'
 
 
+def _render_confidence_coverage(qcc: Optional[dict]) -> str:
+    """
+    STEP 13 -- Quality / Confidence / Coverage separation: renders
+    Confidence and Coverage as two more cards alongside the existing
+    Overall Quality gauge, using the identical card style
+    _render_categories already established -- these three numbers are
+    meant to be read side by side (see this module's docstring for why
+    the same Quality score can mean very different things depending on
+    Confidence/Coverage).
+    """
+    if not qcc:
+        return ""
+
+    def _card(title, subtitle, axis):
+        color = _color_for(axis["classification"])
+        score_display = f'{axis["score"]:.1f}' if axis["score"] is not None else "&mdash;"
+        components_html = "".join(
+            f'<li>{escape(c["detail"])}</li>' for c in axis["components"]
+        )
+        components_block = (
+            f'<details style="margin-top:0.4rem;"><summary style="cursor:pointer; color:var(--text-secondary); font-size:0.78rem;">why?</summary>'
+            f'<ul style="margin:0.3rem 0 0; padding-left:1.1rem; font-size:0.78rem; color:var(--text-secondary);">{components_html}</ul></details>'
+            if axis["components"] else ""
+        )
+        return f"""
+        <div class="category-card" style="--card-color:{color}">
+          <div class="cat-label">{escape(title)}</div>
+          <div class="cat-metric">{escape(subtitle)}</div>
+          <div class="cat-score" style="color:{color}">{score_display}</div>
+          {_badge(axis["classification"])}
+          {components_block}
+        </div>
+        """
+
+    cards = (
+        _card("Confidence", "How much this run's own measurement process can be trusted.", qcc["confidence"])
+        + _card("Coverage", "How much of the sensor's depth/FOV range was actually exercised.", qcc["coverage"])
+    )
+    return f"""
+    <section class="metric-section">
+      <h3>STEP13 &middot; Quality / Confidence / Coverage</h3>
+      <p class="metric-subtitle">The same Overall Quality score above can mean very different things depending on these two: a high score from a thorough, well-synced, fully-matched measurement across the sensor's whole range (high Confidence + Coverage) is trustworthy; the same score from a thin, narrow, partially-failed one is not yet a verdict.</p>
+      <div class="category-grid">{cards}</div>
+    </section>
+    """
+
+
+def _render_input_validation(input_validation: Optional[dict]) -> str:
+    """
+    STEP 1 -- Input Validation section. Rendered near the top of the
+    report, before any calibration-quality metric, so a broken input reads
+    as exactly that -- not folded into (or mistaken for) a calibration
+    verdict. Omitted entirely if input_validation is None (e.g. --demo).
+    """
+    if input_validation is None:
+        return ""
+    status = input_validation["status"]
+    reasons = input_validation.get("reasons") or []
+    reasons_html = (
+        "<ul class='data-table' style='padding-left:1.25rem; margin-top:0.5rem;'>"
+        + "".join(f"<li style='color:var(--text-secondary); margin:0.25rem 0;'>{escape(r)}</li>" for r in reasons)
+        + "</ul>"
+    ) if reasons else ""
+    return f"""
+    <section class="metric-section">
+      <h3>Input Validation {_badge(status)}</h3>
+      <p class="metric-subtitle">STEP1 -- does the raw camera/LiDAR/dataset input itself hold up, before any calibration judgement is made?</p>
+      {reasons_html}
+    </section>
+    """
+
+
+def _render_synchronization(sync: Optional[dict]) -> str:
+    """
+    STEP 2 -- Timestamp Synchronization section: matched frame count,
+    estimated clock offset (Δt) and its residual jitter (std), drop
+    ratio, and GOOD/WARNING/BAD/FAIL classification. Omitted if sync
+    never ran (sync is None).
+    """
+    if sync is None:
+        return ""
+    return f"""
+    <section class="metric-section">
+      <h3>Synchronization {_badge(sync["classification"])}</h3>
+      <p class="metric-subtitle">STEP2 -- candidate-window + monotonic camera&harr;LiDAR frame matching, with clock offset (&Delta;t) estimation.</p>
+      <div class="stat-grid">
+        {_stat("Matched frames", f'{sync["num_matched"]} / {sync["num_camera_frames"]}')}
+        {_stat("Mean &Delta;t", _fmt(sync["estimated_offset_ms"], " ms", digits=1))}
+        {_stat("Offset std", _fmt(sync["offset_std_ms"], " ms", digits=1))}
+        {_stat("Drop ratio", _fmt(sync["drop_ratio"] * 100 if sync["drop_ratio"] is not None else None, "%", digits=1))}
+        {_stat("Camera dropped", _fmt(sync["num_camera_dropped"]))}
+        {_stat("LiDAR dropped", _fmt(sync["num_lidar_dropped"]))}
+      </div>
+    </section>
+    """
+
+
+def _render_projection_overlay(projection_overlay_png: Optional[bytes]) -> str:
+    """
+    STEP 3 -- raw projection sanity-check section: every valid projected
+    LiDAR point drawn on the plain camera image, colored by depth. Unlike
+    the M2 section's overlay (GOOD/WARNING/BAD per-point, matched edge
+    points only), this needs no edge-matching to have run at all -- it's
+    meant as the first, cheapest "does this even look right" check.
+    Omitted if the image wasn't generated (e.g. --no-visuals, or a broken
+    3D/plotting environment for OTHER visuals -- this one is plain OpenCV
+    2D drawing, so it doesn't share that particular failure mode).
+    """
+    if not projection_overlay_png:
+        return ""
+    return f"""
+    <section class="metric-section">
+      <h3>Projection Sanity Check</h3>
+      <p class="metric-subtitle">STEP3 -- every valid LiDAR point projected onto the raw camera image, colored by depth (near&rarr;warm, far&rarr;cool). No edge-matching involved -- just "does the projected point cloud's shape follow the image's real geometry?"</p>
+      {_img_tag(projection_overlay_png, "All valid projected LiDAR points over the raw camera image, colored by depth")}
+    </section>
+    """
+
+
+def _render_range_image(range_image_png: Optional[bytes]) -> str:
+    """
+    STEP 4 -- LiDAR Ring/Topology section: the range image (ring rows x
+    azimuth columns, colored by range) with LiDAR-native depth-
+    discontinuity cells marked. Independent of camera projection/
+    extrinsic entirely -- this is purely "what does the LiDAR's own scan
+    structure look like". Omitted if the image wasn't generated (e.g.
+    --no-visuals, or a broken plotting environment for OTHER visuals --
+    this one shares camera_frustum/colorized_pointcloud's matplotlib
+    degrade-to-None pattern, so it can also be silently absent there).
+    """
+    if not range_image_png:
+        return ""
+    return f"""
+    <section class="metric-section">
+      <h3>LiDAR Range Image</h3>
+      <p class="metric-subtitle">STEP4 -- the LiDAR's own scan structure (ring &times; azimuth), colored by range. Highlighted points are LiDAR-native depth discontinuities -- detected from adjacent laser returns in the actual scan, not from where points happen to land after projection.</p>
+      {_img_tag(range_image_png, "LiDAR range image: ring rows by azimuth columns, colored by range, with native depth-discontinuity cells highlighted")}
+    </section>
+    """
+
+
+def _render_motion_deskew(motion_deskew: Optional[dict], deskew_comparison_png: Optional[bytes]) -> str:
+    """
+    STEP 5 -- Motion Deskew section: the platform-velocity-driven
+    before/after comparison (motion.deskew.compare_before_after's
+    summary dict + visualization.deskew_comparison's BEV/histogram
+    image). Opt-in (app.cli's --deskew-* flags) -- omitted entirely if
+    the caller never ran deskewing (motion_deskew is None), since
+    deskewing needs an external platform-velocity input this tool has no
+    way to measure on its own.
+    """
+    if motion_deskew is None:
+        return ""
+    return f"""
+    <section class="metric-section">
+      <h3>Motion Deskew</h3>
+      <p class="metric-subtitle">STEP5 -- per-point correction for platform motion during the LiDAR scan (constant-velocity model). At zero platform velocity this is exactly a no-op; the numbers below reflect the velocity actually supplied for this run.</p>
+      <div class="stat-grid">
+        {_stat("Points", _fmt(motion_deskew.get("num_points")))}
+        {_stat("Scan period", _fmt(motion_deskew.get("scan_period_s"), " s"))}
+        {_stat("Reference time", _fmt(motion_deskew.get("reference_time_s"), " s"))}
+        {_stat("Mean correction", _fmt(motion_deskew.get("mean_correction_m"), " m"))}
+        {_stat("P95 correction", _fmt(motion_deskew.get("p95_correction_m"), " m"))}
+        {_stat("Max correction", _fmt(motion_deskew.get("max_correction_m"), " m"))}
+      </div>
+      {_img_tag(deskew_comparison_png, "Bird's-eye view of LiDAR points before vs after motion deskew, plus a histogram of per-point correction magnitude")}
+    </section>
+    """
+
+
+def _render_dynamic_filter(dynamic_filter: Optional[dict], dynamic_filter_overlay_png: Optional[bytes]) -> str:
+    """
+    STEP 8 -- Dynamic Object Filtering section: M2 computed with vs
+    without moving-object points (evaluation.dynamic_filter.
+    DynamicFilteringComparison), plus the static/dynamic/unknown overlay
+    image. Opt-in (app.cli's --dynamic-filter flag) -- omitted entirely
+    if the caller never ran it. Diagnostic only: never changes
+    quality_score, which is always computed on the unfiltered point set.
+    """
+    if dynamic_filter is None:
+        return ""
+    contamination = dynamic_filter.get("dynamic_contamination_ratio")
+    contamination_str = _fmt(contamination * 100 if contamination is not None else None, "%", digits=1)
+    return f"""
+    <section class="metric-section">
+      <h3>Dynamic Object Filtering</h3>
+      <p class="metric-subtitle">STEP8 -- M2 computed with every edge point ("overall") vs. with points on likely-moving objects removed ("static only"), so apparent misalignment caused by a moving object (rather than the calibration itself) can be told apart. Classification comes from multi-frame motion consistency and assumes the platform was approximately stationary across the frame window used -- see evaluation/dynamic_filter.py for that caveat.</p>
+      <div class="stat-grid">
+        {_stat("Overall mean error", _fmt(dynamic_filter.get("overall_mean_px"), " px"))}
+        {_badge(dynamic_filter.get("overall_classification", "FAIL"))}
+        {_stat("Static-only mean error", _fmt(dynamic_filter.get("static_only_mean_px"), " px"))}
+        {_badge(dynamic_filter.get("static_only_classification", "FAIL"))}
+        {_stat("Dynamic contamination", contamination_str)}
+        {_stat("Points removed", _fmt(dynamic_filter.get("num_dynamic_points_removed")))}
+      </div>
+      {_img_tag(dynamic_filter_overlay_png, "Projected LiDAR points colored by static (green) / dynamic (red) / unknown (gray) classification")}
+    </section>
+    """
+
+
+def _render_root_cause(root_cause: Optional[dict]) -> str:
+    """
+    STEP 12 -- Root Cause Diagnosis Engine: the ranked list of plausible
+    causes evaluation.root_cause.diagnose_root_cause produces by cross-
+    referencing every other diagnostic this report already contains
+    (sync, M2/M3/M4, spatial analysis, dynamic filtering, sensitivity).
+
+    STEP 14 -- confirmations (the spec's own 🟢 "Timestamp OK" / "Sensor
+    quality OK" half of its diagnosis panel example) are rendered as
+    additional rows in the SAME table, right after the candidates --
+    exactly the spec's mixed panel, not a separate "everything is fine"
+    box competing for attention elsewhere in the report.
+
+    Always present in the report (root_cause_diagnosis is never None),
+    but this section renders nothing when there's neither a candidate
+    NOR a confirmation to show, rather than an empty box.
+    """
+    candidates = (root_cause or {}).get("candidates") or []
+    confirmations = (root_cause or {}).get("confirmations") or []
+    if not candidates and not confirmations:
+        return ""
+
+    rows = "".join(
+        f'<tr><td>{i}</td><td>{escape(c["label"])}</td><td>{_badge(c["confidence"])}</td>'
+        f'<td><ul style="margin:0; padding-left:1.1rem;">'
+        + "".join(f"<li>{escape(e)}</li>" for e in c["evidence"])
+        + '</ul></td></tr>'
+        for i, c in enumerate(candidates, start=1)
+    )
+    confirmation_rows = "".join(
+        f'<tr style="opacity:0.85;"><td>{len(candidates) + i}</td><td>{escape(c["label"])}</td>'
+        f'<td><span class="badge" style="color:{_color_for("GOOD")}">OK</span></td>'
+        f'<td>{escape(c["detail"])}</td></tr>'
+        for i, c in enumerate(confirmations, start=1)
+    )
+    return f"""
+    <section class="metric-section" style="border-color:var(--accent, #58A6FF);">
+      <h3>&#11088; Root Cause Diagnosis</h3>
+      <p class="metric-subtitle">STEP12 -- a ranked, rule-based ("if X and Y, then Z") diagnosis combining every signal in this report (timestamp sync, M2/M3/M4, depth/spatial analysis, dynamic object filtering, and calibration sensitivity) into plausible explanations for what's actually wrong, not just how wrong it is. STEP14 -- confirmed-clean checks (&#128994;) are listed alongside flagged problems, not just the problems.</p>
+      <table class="data-table">
+        <thead><tr><th>#</th><th>Cause</th><th>Confidence</th><th>Evidence</th></tr></thead>
+        <tbody>{rows}{confirmation_rows}</tbody>
+      </table>
+    </section>
+    """
+
+
 def _render_m2(
     m2: dict,
     overlay_png: Optional[bytes] = None,
@@ -487,7 +741,14 @@ def _render_m2(
     colorized_pointcloud_png: Optional[bytes] = None,
     error_heatmap_png: Optional[bytes] = None,
     bev_dual_panel_png: Optional[bytes] = None,
+    uncertainty_plot_png: Optional[bytes] = None,
 ) -> str:
+    match_rate_stat = ""
+    if m2.get("match_rate") is not None:
+        match_rate_stat = _stat("Match rate (STEP6)", _fmt(m2["match_rate"] * 100, "%", digits=1))
+    normalized_error_stat = ""
+    if m2.get("mean_normalized_error") is not None:
+        normalized_error_stat = _stat("Mean normalized error", _fmt(m2["mean_normalized_error"], "x floor"))
     return f"""
     <section class="metric-section">
       <h3>M2 &middot; Edge Alignment {_badge(m2["classification"])}</h3>
@@ -499,6 +760,8 @@ def _render_m2(
         {_stat("Max error", _fmt(m2["max_px"], " px"))}
         {_stat("Noise floor", _fmt(m2["floor_px"], " px"))}
         {_stat("Edge points", _fmt(m2["num_edge_points"]))}
+        {match_rate_stat}
+        {normalized_error_stat}
       </div>
       {_img_tag(overlay_png, "Projected LiDAR edge points over the camera image, colored GOOD/WARNING/BAD")}
       {_img_tag(histogram_png, "Histogram of per-point alignment error")}
@@ -509,6 +772,67 @@ def _render_m2(
       {_img_tag(bev_dual_panel_png, "Camera image and bird's-eye view side by side, with the same edge points highlighted and colored to match in both")}
       <p class="metric-subtitle" style="margin-top:1.25rem;">Fused view: LiDAR points colorized by the camera pixel they project onto. Color bleed or smearing at object edges is a visual sign of extrinsic misalignment.</p>
       {_img_tag(colorized_pointcloud_png, "LiDAR point cloud colorized by projected camera pixel, shown from a 3D angle and bird's-eye view")}
+      <p class="metric-subtitle" style="margin-top:1.25rem;">STEP7 -- per-point error vs. the sensor-relative noise floor at EACH point's own depth: points hugging the floor(Z) curve are consistent with ordinary sensor noise (however large their raw pixel error looks in isolation); points well above it are the ones actually worth investigating as a calibration problem.</p>
+      {_img_tag(uncertainty_plot_png, "Scatter of per-point error against depth, with the sensor-relative noise floor curve and GOOD/WARNING/BAD bands overlaid")}
+    </section>
+    """
+
+
+def _render_bin_table(bins: dict, order: list) -> str:
+    rows = ""
+    for label in order:
+        b = bins.get(label)
+        if b is None:
+            continue
+        total = b.get("total_count", 0)
+        failed = b.get("failure_count", 0)
+        rows += f"""
+          <tr>
+            <td>{escape(label)}</td>
+            <td>{_fmt(b.get("mean_px"), " px")}</td>
+            <td>{_fmt(b.get("median_px"), " px")}</td>
+            <td>{_fmt(b.get("p95_px"), " px")}</td>
+            <td>{_fmt(b.get("std_px"), " px")}</td>
+            <td>{total}</td>
+            <td>{failed}</td>
+          </tr>"""
+    return f"""
+      <table class="data-table">
+        <thead><tr><th>Region</th><th>Mean</th><th>Median</th><th>P95</th><th>Std</th><th>n</th><th>Failed</th></tr></thead>
+        <tbody>{rows}
+        </tbody>
+      </table>
+    """
+
+
+def _render_spatial_analysis(spatial: Optional[dict], spatial_analysis_png: Optional[bytes]) -> str:
+    """
+    STEP 9 -- Depth/Spatial Error Analysis section: mean/median/P95/std +
+    valid/failure counts per depth bin (0-10m/10-20m/20-30m/30-50m/50m+)
+    and per camera region (LEFT/CENTER/RIGHT, TOP/CENTER/BOTTOM), plus the
+    bar-chart visualization and a plain-language depth-trend line. Always
+    present when M2 succeeded (no extra opt-in input needed, unlike
+    STEP5/STEP8) -- omitted only if M2 itself FAILed.
+    """
+    if spatial is None:
+        return ""
+    trend = spatial.get("depth_trend")
+    trend_text = {
+        "increases_with_depth": "Error increases with depth -- worth checking whether this is within sensor-relative expectations (see the STEP7 uncertainty plot above) or a genuine calibration issue that only shows up at range.",
+        "decreases_with_depth": "Error decreases with depth.",
+        "stable": "No clear depth trend -- error doesn't consistently grow or shrink with range.",
+        None: "Not enough populated depth bins to determine a trend.",
+    }.get(trend, "")
+    return f"""
+    <section class="metric-section">
+      <h3>M2 &middot; Depth / Spatial Analysis</h3>
+      <p class="metric-subtitle">STEP9 -- M2's per-point errors broken down by depth bin and by camera region, instead of collapsed into one mean. {escape(trend_text)}</p>
+      {_img_tag(spatial_analysis_png, "Bar charts of mean error (with std error bars and P95 markers) by depth bin, horizontal region, and vertical region")}
+      <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:1rem; margin-top:1rem;">
+        <div><h4 style="color:var(--text-secondary); font-size:0.8rem; margin-bottom:0.5rem;">By depth</h4>{_render_bin_table(spatial.get("depth_bins", {}), ["0-10m", "10-20m", "20-30m", "30-50m", "50m+"])}</div>
+        <div><h4 style="color:var(--text-secondary); font-size:0.8rem; margin-bottom:0.5rem;">By horizontal region</h4>{_render_bin_table(spatial.get("horizontal_regions", {}), ["LEFT", "CENTER", "RIGHT"])}</div>
+        <div><h4 style="color:var(--text-secondary); font-size:0.8rem; margin-bottom:0.5rem;">By vertical region</h4>{_render_bin_table(spatial.get("vertical_regions", {}), ["TOP", "CENTER", "BOTTOM"])}</div>
+      </div>
     </section>
     """
 
@@ -517,15 +841,30 @@ def _render_m3(m3: dict) -> str:
     rows = "".join(
         f'<tr><td>{b["block_index"]}</td><td>{b["num_frames_valid"]}/{b["num_frames_total"]}</td>'
         f'<td>{_fmt(b["mean_px"], " px")}</td><td>{_fmt(b["p95_px"], " px")}</td>'
+        f'<td>{_fmt(b["representative_depth_m"], " m")}</td><td>{_fmt(b["edge_density"], "/frame")}</td>'
+        f'<td>{_fmt(b["fov_coverage"] * 100 if b["fov_coverage"] is not None else None, "%", digits=0)}</td>'
         f'<td>{_badge(b["classification"])}</td></tr>'
         for b in m3["blocks"]
     )
     table = f"""
     <table class="data-table">
-      <thead><tr><th>Block</th><th>Frames</th><th>Mean</th><th>P95</th><th>Status</th></tr></thead>
+      <thead><tr><th>Block</th><th>Frames</th><th>Mean</th><th>P95</th><th>Depth</th><th>Edge density</th><th>FOV coverage</th><th>Status</th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
     """ if m3["blocks"] else "<p style='color:var(--text-secondary)'>No blocks evaluated.</p>"
+
+    diagnosis = m3.get("instability_diagnosis")
+    diagnosis_html = ""
+    if diagnosis and diagnosis.get("candidates"):
+        top = diagnosis["candidates"][0]
+        diagnosis_html = f"""
+        <div class="warning-item" style="margin-top:0.75rem;">
+          <strong>STEP10 instability diagnosis:</strong> Block {diagnosis["worst_block_index"]}
+          (mean {_fmt(diagnosis["worst_block_mean_px"], " px")}) differs from the other blocks'
+          {escape(top["metric"])} by {top["relative_diff"]:+.0%} &mdash; possible cause:
+          <em>{escape(top["explanation"])}</em>.
+        </div>
+        """
 
     return f"""
     <section class="metric-section">
@@ -539,6 +878,7 @@ def _render_m3(m3: dict) -> str:
         {_stat("Valid blocks", _fmt(m3["num_valid_blocks"]))}
       </div>
       {table}
+      {diagnosis_html}
       {_render_warning_list(m3["warnings"])}
     </section>
     """
@@ -559,6 +899,7 @@ def _render_m4(m4: dict, trajectory_png: Optional[bytes] = None) -> str:
     rows = "".join(
         f'<tr style="{"color:var(--bad)" if f["is_outlier"] else ""}">'
         f'<td>{f["frame_index"]}</td><td>{_fmt(f["mean_px"], " px")}</td>'
+        f'<td>{_fmt(f["robust_z_score"])}</td>'
         f'<td>{_badge(f["classification"])}</td>'
         f'<td>{"outlier" if f["is_outlier"] else ""}</td></tr>'
         for f in sample
@@ -570,7 +911,7 @@ def _render_m4(m4: dict, trajectory_png: Optional[bytes] = None) -> str:
     )
     table = f"""
     <table class="data-table">
-      <thead><tr><th>Frame</th><th>Mean</th><th>Status</th><th></th></tr></thead>
+      <thead><tr><th>Frame</th><th>Mean</th><th>Robust z</th><th>Status</th><th></th></tr></thead>
       <tbody>{rows}</tbody>
     </table>
     {note}
@@ -579,18 +920,36 @@ def _render_m4(m4: dict, trajectory_png: Optional[bytes] = None) -> str:
     return f"""
     <section class="metric-section">
       <h3>M4 &middot; Multi-frame Consistency {_badge(m4["classification"])}</h3>
-      <p class="metric-subtitle">Whether error stays stable frame-to-frame, or specific frames spike.</p>
+      <p class="metric-subtitle">Whether error stays stable frame-to-frame, or specific frames spike. Outlier detection: {escape(m4.get("outlier_method", "multiplier"))} method (STEP10 -- MAD/IQR-based robust statistics, replacing a plain multiple-of-median rule).</p>
       <div class="stat-grid">
         {_stat("Mean", _fmt(m4["mean_across_frames_px"], " px"))}
         {_stat("STD", _fmt(m4["std_across_frames_px"], " px"))}
         {_stat("P95", _fmt(m4["p95_across_frames_px"], " px"))}
         {_stat("Max", _fmt(m4["max_across_frames_px"], " px"))}
-        {_stat("Outlier frames", _fmt(m4["num_outlier_frames"]))}
-        {_stat("Frames evaluated", f'{m4["num_valid_frames"]}/{m4["num_frames_total"]}')}
+        {_stat("MAD", _fmt(m4.get("mad_px"), " px"))}
+        {_stat("IQR", _fmt(m4.get("iqr_px"), " px"))}
+        {_stat("Valid ratio", _fmt(m4.get("valid_ratio") * 100 if m4.get("valid_ratio") is not None else None, "%", digits=1))}
+        {_stat("Failure ratio", _fmt(m4.get("failure_ratio") * 100 if m4.get("failure_ratio") is not None else None, "%", digits=1))}
+        {_stat("Outlier ratio", _fmt(m4.get("outlier_ratio") * 100 if m4.get("outlier_ratio") is not None else None, "%", digits=1))}
       </div>
       {table}
       {_img_tag(trajectory_png, "Per-frame error trajectory with outliers marked")}
       {_render_warning_list(m4["warnings"])}
+    </section>
+    """
+
+
+def _render_sequence_gif(gif_bytes: Optional[bytes]) -> str:
+    """Render the (opt-in, --sequence-gif) animated overlay section.
+    Returns "" if no GIF was generated, so callers can splice this in
+    unconditionally."""
+    if not gif_bytes:
+        return ""
+    return f"""
+    <section class="metric-section">
+      <h3>Sequence Overlay</h3>
+      <p class="metric-subtitle">M2's overlay, sampled across the sequence and animated -- shows whether alignment quality holds steady over time or drifts, rather than a single snapshot.</p>
+      {_img_tag(gif_bytes, "Animated GIF of the M2 overlay across sampled frames in the sequence", mime="image/gif")}
     </section>
     """
 
@@ -720,7 +1079,7 @@ def _render_metadata(metadata: dict) -> str:
     """
 
 
-def _render_advanced(advanced: Optional[dict]) -> str:
+def _render_advanced(advanced: Optional[dict], sensitivity_png: Optional[bytes] = None) -> str:
     if not advanced:
         return ""
     parts = []
@@ -746,6 +1105,23 @@ def _render_advanced(advanced: Optional[dict]) -> str:
         best = perturbation.get("best_sample")
         best_str = (f'{best["axis"]} {best["direction"]}{best["delta"]} &rarr; {best["mean_px"]:.3f} px'
                     if best else "&mdash;")
+        axis_sensitivities = perturbation.get("axis_sensitivities") or []
+        sensitivity_rows = "".join(
+            f'<tr><td>{escape(a["axis"])}</td><td>{_badge(a["classification"])}</td>'
+            f'<td>{_fmt(a["small_delta_effect_px"], " px")}</td><td>{_fmt(a["large_delta_effect_px"], " px")}</td></tr>'
+            for a in axis_sensitivities
+        )
+        sensitivity_table = f"""
+        <table class="data-table">
+          <thead><tr><th>Axis</th><th>Sensitivity</th><th>Effect @ smallest &Delta;</th><th>Effect @ largest &Delta;</th></tr></thead>
+          <tbody>{sensitivity_rows}</tbody>
+        </table>
+        """ if axis_sensitivities else ""
+        timestamp_note = (
+            "" if perturbation.get("timestamp_sensitivity_computed")
+            else "<p class='metric-subtitle' style='margin-top:0.5rem;'>Timestamp sensitivity not computed -- "
+                 "requires an assumed platform velocity (this tool has no independent way to measure one).</p>"
+        )
         parts.append(f"""
         <section class="metric-section">
           <h3>Perturbation Sensitivity {_badge(perturbation["classification"])}</h3>
@@ -757,6 +1133,10 @@ def _render_advanced(advanced: Optional[dict]) -> str:
             {_stat("Best nudge", best_str)}
           </div>
           {_render_warning_list(perturbation["warnings"])}
+          <p class="metric-subtitle" style="margin-top:1.25rem;">STEP11 -- Calibration Sensitivity Analysis: how much each parameter's error changes as it's nudged by increasing amounts, ranked HIGH/MEDIUM/LOW relative to the sensor-relative noise floor. This is the data a future Root Cause Diagnosis Engine would use (e.g. "yaw sensitivity is HIGH and error concentrates on one side of the frame" -> yaw misalignment is a plausible cause).</p>
+          {_img_tag(sensitivity_png, "Horizontal bar chart ranking each calibration parameter's sensitivity (HIGH/MEDIUM/LOW)")}
+          {sensitivity_table}
+          {timestamp_note}
         </section>
         """)
 
@@ -795,9 +1175,31 @@ def render_html_report(report: dict, visuals: Optional[dict] = None) -> str:
       "error_heatmap_png"        -- from visualization.error_heatmap.render_error_heatmap_from_result(...)
       "camera_frustum_png"       -- from visualization.camera_frustum.render_camera_frustum_from_dataset(...)
       "bev_dual_panel_png"       -- from visualization.bev_dual_panel.render_bev_dual_panel_from_result(...)
+      "uncertainty_plot_png"     -- from visualization.uncertainty_plot.render_uncertainty_plot_from_result(...)
+                                     (STEP7: per-point error vs. sensor-relative noise floor at each point's
+                                     own depth -- distinguishes sensor noise from real calibration error)
+      "spatial_analysis_png"     -- from visualization.spatial_analysis_plot.render_spatial_analysis_from_result(...)
+                                     (STEP9: M2 error broken down by depth bin and camera region instead of
+                                     one mean -- see report["m2_spatial_analysis"] for the paired numeric tables)
+      "projection_overlay_png"   -- from visualization.projection_overlay.render_projection_overlay_from_frame(...)
+                                     (STEP3: raw depth-colored LiDAR->image projection, independent of M2's
+                                     edge-matching -- a basic "does projection look sane" sanity check)
+      "range_image_png"          -- from visualization.range_image.render_range_image_from_points(...)
+                                     (STEP4: LiDAR-native ring x azimuth range image with native depth-
+                                     discontinuity cells highlighted -- independent of camera projection entirely)
+      "deskew_comparison_png"    -- from visualization.deskew_comparison.render_deskew_comparison_from_points(...)
+                                     (STEP5: before/after BEV overlay + correction-magnitude histogram for
+                                     motion deskew -- only present if the caller opted in with a nonzero
+                                     platform velocity; see report["motion_deskew"] for the paired numeric summary)
+      "dynamic_filter_overlay_png" -- from visualization.dynamic_filter_overlay.render_dynamic_filter_overlay_from_frame(...)
+                                     (STEP8: projected points colored static/dynamic/unknown -- only present if
+                                     the caller opted in with --dynamic-filter; see report["dynamic_filter"] for
+                                     the paired overall-vs-static-only numeric comparison)
       "interactive_scene"        -- a dict from visualization.interactive_viewer.build_interactive_scene(...)
                                      (NOT bytes -- raw JSON-serializable scene data, embedded + rendered
                                      client-side via the vendored plotly.js gl3d bundle)
+      "sequence_gif"             -- GIF bytes from visualization.sequence.render_sequence_gif(...)
+                                     (opt-in via app.cli's --sequence-gif; embedded as image/gif, not image/png)
     Any missing/None key simply omits that image -- visualization is
     optional and the report renders fine without it (see report/json.py's
     counterpart: the JSON report never carries images, only this HTML one).
@@ -807,15 +1209,25 @@ def render_html_report(report: dict, visuals: Optional[dict] = None) -> str:
     quality = report["quality_score"]
 
     body = (
-        _render_hero(quality)
+        _render_input_validation(report.get("input_validation"))
+        + _render_synchronization(report.get("synchronization"))
+        + _render_hero(quality)
         + _render_categories(quality)
+        + _render_confidence_coverage(report.get("quality_confidence_coverage"))
+        + _render_root_cause(report.get("root_cause_diagnosis"))
         + _render_rig_geometry(metadata, visuals.get("camera_frustum_png"), visuals.get("interactive_scene"))
+        + _render_projection_overlay(visuals.get("projection_overlay_png"))
+        + _render_range_image(visuals.get("range_image_png"))
+        + _render_motion_deskew(report.get("motion_deskew"), visuals.get("deskew_comparison_png"))
+        + _render_dynamic_filter(report.get("dynamic_filter"), visuals.get("dynamic_filter_overlay_png"))
         + _render_m2(report["m2_edge_alignment"], visuals.get("overlay_png"), visuals.get("histogram_png"),
                      visuals.get("colorized_pointcloud_png"), visuals.get("error_heatmap_png"),
-                     visuals.get("bev_dual_panel_png"))
+                     visuals.get("bev_dual_panel_png"), visuals.get("uncertainty_plot_png"))
+        + _render_spatial_analysis(report.get("m2_spatial_analysis"), visuals.get("spatial_analysis_png"))
         + _render_m3(report["m3_holdout_consistency"])
         + _render_m4(report["m4_multiframe_consistency"], visuals.get("trajectory_png"))
-        + _render_advanced(report.get("advanced"))
+        + _render_sequence_gif(visuals.get("sequence_gif"))
+        + _render_advanced(report.get("advanced"), visuals.get("sensitivity_png"))
         + _render_metadata(metadata)
         + _render_warning_list(report.get("warnings", []))
     )

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cam-lidar-eval"
-version = "0.1.0"
+version = "0.2.0"
 description = "GT-free quality evaluation for an existing camera-LiDAR extrinsic calibration"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,6 +38,7 @@ dependencies = [
     "scipy>=1.11",
     "matplotlib>=3.8",
     "PyYAML>=6.0",
+    "jsonschema>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -68,6 +69,7 @@ packages = [
     "evaluation",
     "geometry",
     "input",
+    "motion",
     "quality",
     "report",
     "visualization",

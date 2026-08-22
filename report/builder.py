@@ -30,7 +30,10 @@ from input.dataset import EvaluationDataset
 from quality.quality_score import QualityScoreResult
 
 
-TOOL_VERSION = "0.1.0-mvp"
+# Kept in sync with pyproject.toml's [project].version by hand (no
+# single-source-of-truth mechanism yet -- see CONTRIBUTING.md's release
+# checklist). Bump this whenever pyproject.toml's version changes.
+TOOL_VERSION = "0.2.0"
 
 
 def _num(x: Any) -> Optional[float]:
@@ -57,6 +60,19 @@ def _matrix_to_list(T: np.ndarray) -> list[list[float]]:
 # Per-metric summary dicts
 # ---------------------------------------------------------------------------
 
+def spatial_analysis_summary(analysis) -> Optional[dict]:
+    """
+    STEP 9 -- Depth/Spatial Error Analysis report section. Takes an
+    already-computed evaluation.spatial_analysis.SpatialAnalysisResult
+    (or None) -- build_report computes it once and shares it with
+    STEP12's root_cause_summary below, rather than each recomputing it
+    independently.
+    """
+    if analysis is None:
+        return None
+    return analysis.to_dict()
+
+
 def m2_summary(m2: EdgeAlignmentResult) -> dict:
     return {
         "metric": "M2",
@@ -71,6 +87,20 @@ def m2_summary(m2: EdgeAlignmentResult) -> dict:
         "representative_depth_m": _num(m2.representative_depth_m),
         "floor_px": _num(m2.floor_px),
         "warnings": list(m2.warnings),
+        # STEP6 -- correspondence-matching diagnostics. None (all three)
+        # when use_correspondence_matching=False.
+        "num_matched": m2.num_matched,
+        "num_unmatched": m2.num_unmatched,
+        "match_rate": _num(m2.match_rate),
+        # STEP7 -- Noise/Uncertainty Model summary stats. Per-point arrays
+        # (edge_point_floor_px, edge_point_normalized_errors,
+        # edge_point_depths_m) are intentionally NOT included here, same
+        # reasoning as edge_point_pixels/edge_point_errors_px above: a
+        # report reader wants summary statistics, not raw per-point
+        # arrays -- those belong to visualization.uncertainty_plot.
+        "mean_normalized_error": _num(m2.mean_normalized_error),
+        "median_normalized_error": _num(m2.median_normalized_error),
+        "p95_normalized_error": _num(m2.p95_normalized_error),
     }
 
 
@@ -93,9 +123,17 @@ def m3_summary(m3: HoldoutConsistencyResult) -> dict:
                 "median_px": _num(b.median_px),
                 "p95_px": _num(b.p95_px),
                 "classification": b.classification,
+                # STEP10 -- scene metadata (see evaluation/holdout_consistency.py)
+                "representative_depth_m": _num(b.representative_depth_m),
+                "edge_density": _num(b.edge_density),
+                "num_points_avg": _num(b.num_points_avg),
+                "fov_coverage": _num(b.fov_coverage),
+                "dynamic_ratio": _num(b.dynamic_ratio) if b.dynamic_ratio is not None else None,
             }
             for b in m3.block_results
         ],
+        # STEP10 -- instability diagnosis (see evaluation.holdout_consistency.diagnose_instability)
+        "instability_diagnosis": m3.instability_diagnosis,
         "warnings": list(m3.warnings),
     }
 
@@ -116,6 +154,16 @@ def m4_summary(m4: MultiFrameConsistencyResult) -> dict:
         "p95_across_frames_px": _num(m4.p95_across_frames_px),
         "max_across_frames_px": _num(m4.max_across_frames_px),
         "floor_px": _num(m4.floor_px),
+        # STEP10 -- robust statistics + separated ratios (see
+        # evaluation/multiframe_consistency.py's module docstring)
+        "outlier_method": m4.outlier_method,
+        "mad_px": _num(m4.mad_px),
+        "iqr_px": _num(m4.iqr_px),
+        "q1_px": _num(m4.q1_px),
+        "q3_px": _num(m4.q3_px),
+        "valid_ratio": _num(m4.valid_ratio),
+        "failure_ratio": _num(m4.failure_ratio),
+        "outlier_ratio": _num(m4.outlier_ratio),
         # per-frame trajectory, trimmed to the essentials needed for a
         # trend chart (frame_index, mean_px, is_outlier) -- omits per-frame
         # warnings/edge-point counts to keep this from ballooning on long
@@ -127,6 +175,7 @@ def m4_summary(m4: MultiFrameConsistencyResult) -> dict:
                 "mean_px": _num(f.mean_px),
                 "classification": f.classification,
                 "is_outlier": f.is_outlier,
+                "robust_z_score": _num(f.robust_z_score),
             }
             for f in m4.frame_results
         ],
@@ -168,6 +217,55 @@ def m0_summary(m0: Optional[dict]) -> Optional[dict]:
     return m0
 
 
+def synchronization_summary(dataset: EvaluationDataset) -> Optional[dict]:
+    """
+    STEP 2 -- Timestamp Synchronization report section (input/dataset.py's
+    SyncStats). None if sync never ran (shouldn't normally happen once
+    build_dataset has been called, but mirrors m0_summary's Optional
+    passthrough pattern for consistency/robustness).
+    """
+    if dataset.sync_stats is None:
+        return None
+    return dataset.sync_stats.to_dict()
+
+
+def motion_deskew_summary(deskew_compare: Optional[dict]) -> Optional[dict]:
+    """
+    STEP 5 -- Motion Deskew report section. deskew_compare is expected to
+    already be a plain dict (motion.deskew.compare_before_after's output)
+    -- opt-in, so None (the default) simply omits the section, matching
+    input_validation/synchronization's Optional passthrough pattern.
+    Deskewing needs an external platform-velocity input this tool has no
+    way to measure on its own (see motion/deskew.py's module docstring),
+    so unlike STEP1/STEP2 it's never computed unless the caller (app.cli's
+    --deskew-* flags) explicitly supplies one.
+    """
+    return deskew_compare
+
+
+def dynamic_filter_summary(comparison) -> Optional[dict]:
+    """
+    STEP 8 -- Dynamic Object Filtering report section. `comparison` is an
+    evaluation.dynamic_filter.DynamicFilteringComparison (or None). Opt-in
+    like STEP5's deskew -- needs a multi-frame window (for the
+    motion-consistency classifier) or an externally-supplied mask,
+    neither of which is assumed by default, so None simply omits the
+    section.
+    """
+    if comparison is None:
+        return None
+    return {
+        "overall_mean_px": _num(comparison.overall_mean_px),
+        "overall_classification": comparison.overall_classification,
+        "overall_num_edge_points": comparison.overall_num_edge_points,
+        "static_only_mean_px": _num(comparison.static_only_mean_px),
+        "static_only_classification": comparison.static_only_classification,
+        "static_only_num_edge_points": comparison.static_only_num_edge_points,
+        "dynamic_contamination_ratio": _num(comparison.dynamic_contamination_ratio),
+        "num_dynamic_points_removed": comparison.num_dynamic_points_removed,
+    }
+
+
 def plane_consistency_summary(result) -> dict:
     return {
         "metric": "Plane Consistency",
@@ -201,6 +299,17 @@ def perturbation_summary(result) -> dict:
         ),
         "num_samples": len(result.samples),
         "warnings": list(result.warnings),
+        # STEP11 -- per-axis sensitivity ranking (see evaluation/perturbation.py)
+        "axis_sensitivities": [
+            {
+                "axis": a.axis,
+                "classification": a.classification,
+                "small_delta_effect_px": _num(a.small_delta_effect_px),
+                "large_delta_effect_px": _num(a.large_delta_effect_px),
+            }
+            for a in result.axis_sensitivities
+        ],
+        "timestamp_sensitivity_computed": result.timestamp_sensitivity_computed,
     }
 
 
@@ -255,6 +364,8 @@ def build_report(
     plane_result=None,
     perturbation_result=None,
     temporal_drift_result=None,
+    deskew_compare: Optional[dict] = None,
+    dynamic_filter_comparison=None,
 ) -> dict:
     """
     Assemble the full report dict. This is the single source of truth for
@@ -268,6 +379,16 @@ def build_report(
     contribute to quality_score -- they're supplementary diagnostics, not
     part of the MVP scored set -- and are simply omitted from the report
     if not provided.
+
+    deskew_compare: STEP5 -- motion.deskew.compare_before_after(...)'s
+    output dict, if the caller ran deskewing (opt-in; see app.cli's
+    --deskew-* flags). None (default) omits the "motion_deskew" section.
+
+    dynamic_filter_comparison: STEP8 -- an
+    evaluation.dynamic_filter.DynamicFilteringComparison, if the caller
+    ran the dynamic-object-filtering comparison (opt-in; see app.cli's
+    --dynamic-filter flag). None (default) omits the "dynamic_filter"
+    section.
     """
     generated_at = datetime.now(timezone.utc).isoformat()
 
@@ -303,14 +424,41 @@ def build_report(
 
     dataset_warnings = list(dataset.warnings) if dataset.warnings else []
 
+    from evaluation.spatial_analysis import analyze_depth_and_spatial_from_result
+    spatial_analysis_result = analyze_depth_and_spatial_from_result(
+        m2_result, dataset.camera.width, dataset.camera.height,
+    )
+
+    from evaluation.root_cause import diagnose_root_cause
+    root_cause_result = diagnose_root_cause(
+        sync_stats=dataset.sync_stats, m2=m2_result, m3=m3_result, m4=m4_result,
+        spatial_analysis=spatial_analysis_result,
+        dynamic_filter_comparison=dynamic_filter_comparison,
+        perturbation_result=perturbation_result,
+    )
+
+    from quality.confidence_coverage import compute_quality_confidence_coverage
+    confidence_coverage_result = compute_quality_confidence_coverage(
+        quality_result, sync_stats=dataset.sync_stats, m2=m2_result, m3=m3_result, m4=m4_result,
+        spatial_analysis=spatial_analysis_result, input_validation=dataset.input_validation,
+        n_blocks=n_blocks,
+    )
+
     report = {
         "metadata": metadata,
+        "input_validation": dataset.input_validation,
+        "synchronization": synchronization_summary(dataset),
+        "motion_deskew": motion_deskew_summary(deskew_compare),
+        "dynamic_filter": dynamic_filter_summary(dynamic_filter_comparison),
         "m0_sanity_gate": m0_summary(m0_result),
         "m2_edge_alignment": m2_summary(m2_result),
+        "m2_spatial_analysis": spatial_analysis_summary(spatial_analysis_result),
         "m3_holdout_consistency": m3_summary(m3_result),
         "m4_multiframe_consistency": m4_summary(m4_result),
         "quality_score": quality_summary(quality_result),
         "advanced": advanced_summary(plane_result, perturbation_result, temporal_drift_result),
+        "root_cause_diagnosis": root_cause_result.to_dict(),
+        "quality_confidence_coverage": confidence_coverage_result.to_dict(),
         "warnings": dataset_warnings + list(extra_warnings or []),
     }
     return report

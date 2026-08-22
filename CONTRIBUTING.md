@@ -73,3 +73,22 @@ opinionated 규칙까지 켜면 이 코드베이스의 기존 컨벤션과 계�
    `report/html.py`의 advanced 섹션에 연결하세요 (`plane_consistency_summary`
    패턴 참고).
 4. CLI에서 실행 가능해야 한다면 `app/cli.py`에도 연결하세요.
+
+## 릴리스 체크리스트
+
+버전 문자열이 두 곳(`pyproject.toml`의 `[project].version`,
+`report/builder.py`의 `TOOL_VERSION`)에 손으로 동기화되어 있어야 하는
+값이라 자동으로 안 맞으면 조용히 벌어집니다. 릴리스할 때마다:
+
+1. `CHANGELOG.md`의 `[Unreleased]` 섹션에 쌓인 항목들을
+   `## [X.Y.Z] — YYYY-MM-DD`로 이름을 바꾸고, 그 위에 새 빈
+   `## [Unreleased]` 섹션을 추가하세요. 버전 번호는
+   [Semantic Versioning](https://semver.org/)을 따릅니다 — 하위 호환
+   기능 추가는 MINOR(`0.X.0`), 버그 수정만 있다면 PATCH(`0.0.X`), 기존
+   CLI 플래그/config 스키마/report 구조를 깨는 변경이면 MAJOR입니다.
+2. `pyproject.toml`의 `version`을 같은 값으로 올리세요.
+3. `report/builder.py`의 `TOOL_VERSION`을 같은 값으로 올리세요 (이
+   값은 `report.json`/`report.html`의 `metadata.tool_version`에 그대로
+   실립니다).
+4. `./run_tests.sh`와 `ruff check .`가 통과하는지 확인한 뒤 태그를
+   찍으세요.

@@ -257,6 +257,14 @@ def load_lidar_from_pcd_dir(
 
     frames = [LidarFrame(timestamp=ts, path=f, points=None) for ts, f in zip(raw_timestamps, files)]
 
+    # Sort by parsed timestamp value, not by filename string -- see the
+    # matching comment in input/camera.py's load_camera_from_image_dir for
+    # why (lexicographic filename sort != numeric timestamp order for
+    # non-zero-padded numeric filenames), and to mirror
+    # load_lidar_from_rosbag's frames.sort(key=lambda fr: fr.timestamp).
+    if all(np.isfinite(t) for t in raw_timestamps):
+        frames.sort(key=lambda fr: fr.timestamp)
+
     if not lazy:
         for fr in frames:
             fr.load()

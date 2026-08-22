@@ -84,6 +84,35 @@ class CameraModel:
         projection function selector used by geometry/projection.py."""
         return self.model
 
+    def verify_image_shape(self, image: np.ndarray) -> None:
+        """
+        Raise a clear ValueError if `image`'s actual pixel dimensions
+        don't match this CameraModel's declared width/height.
+
+        Nothing in the loading path actually opens an image file to check
+        it against the config's width/height (loading is intentionally
+        lazy -- see CameraFrame.load()), so a typo'd width/height, or an
+        image_dir that mixes differently-sized files, previously surfaced
+        as a downstream IndexError wherever a consumer happened to index
+        into the image array using the declared dimensions (several
+        visualization functions sample image[py, px] directly; others,
+        like Canny-based edge detection, use the image's own shape and
+        don't reveal a mismatch at all, but would still be measuring
+        alignment against the wrong assumed field of view). This is the
+        one place callers can check that instead, with a message that
+        says what's actually wrong.
+        """
+        if image.ndim < 2:
+            raise ValueError(f"Expected a 2D/3D image array, got shape {image.shape}")
+        actual_height, actual_width = image.shape[:2]
+        if actual_width != self.width or actual_height != self.height:
+            raise ValueError(
+                f"Camera config declares width={self.width}, height={self.height}, "
+                f"but the loaded image is {actual_width}x{actual_height}. Check the "
+                f"camera config's width/height against the actual image file, or "
+                f"whether image_dir mixes differently-sized images."
+            )
+
 
 @dataclass
 class CameraFrame:
@@ -185,6 +214,19 @@ def load_camera_from_image_dir(
         CameraFrame(timestamp=ts, path=f, image=None)
         for ts, f in zip(raw_timestamps, files)
     ]
+
+    # Sort by parsed timestamp value, not by filename string -- mirrors
+    # load_camera_from_rosbag's frames.sort(key=lambda fr: fr.timestamp).
+    # `files` above is sorted lexicographically (glob + sorted()), which
+    # is NOT the same as numeric order for non-zero-padded numeric
+    # filenames (e.g. "10.0.png" sorts before "2.0.png" as strings). Real
+    # sensor filename conventions are usually zero-padded or full epoch
+    # timestamps where this coincides, but nothing here should assume
+    # that -- downstream code (dataset.py's sync, this module's own
+    # `timestamp` field, input/validation.py's monotonicity check) all
+    # treat `frames` as being in chronological order.
+    if all(np.isfinite(t) for t in raw_timestamps):
+        frames.sort(key=lambda fr: fr.timestamp)
 
     if not lazy:
         for fr in frames:
